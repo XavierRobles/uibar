@@ -1,0 +1,449 @@
+require('tables')
+
+local res = require('resources')
+local util = require('uibarutil')
+
+local M = {}
+
+local status_on_messages = S{
+    101, 127, 160, 164, 166, 186, 194, 203, 205, 230, 236, 266, 267, 268, 269,
+    237, 271, 272, 277, 278, 279, 280, 319, 320, 375, 412, 645, 754, 755, 804
+}
+local status_off_messages = S{64, 159, 168, 204, 206, 321, 322, 341, 342, 343, 344, 350, 378, 531, 647, 805, 806}
+local death_messages = S{6, 20, 97, 113, 406, 605, 646}
+local spell_damage_messages = S{2, 252, 264, 265}
+
+local known_debuff_duration = {
+    [2] = 60, [3] = 120, [4] = 120, [5] = 180, [6] = 120, [10] = 5, [11] = 60, [12] = 120, [13] = 180,
+    [19] = 90, [128] = 180, [129] = 180, [130] = 180, [131] = 180, [132] = 180, [133] = 180,
+    [134] = 150, [135] = 150, [147] = 180, [148] = 180, [149] = 180, [167] = 120, [186] = 90, [404] = 120
+}
+
+-- Prioritize duration by spell id (closer to XIUI behavior than buff-only fallback).
+local spell_duration = {
+    -- Dia/Bio
+    [23] = 60, [24] = 120, [25] = 150, [33] = 60, [230] = 60, [231] = 120, [232] = 150,
+    -- Core enfeebles
+    [58] = 120, [80] = 120, [56] = 180, [79] = 180, [216] = 120, [254] = 180, [276] = 180,
+    [59] = 120, [359] = 120, [253] = 60, [273] = 60, [363] = 60, [259] = 90, [274] = 90, [364] = 90,
+    [258] = 60, [362] = 60, [252] = 5, [220] = 90, [221] = 120,
+    -- Ninjutsu enfeebles
+    [341] = 180, [342] = 300, [344] = 180, [345] = 300, [347] = 180, [348] = 300,
+    -- Elemental debuffs
+    [235] = 120, [236] = 120, [237] = 120, [238] = 120, [239] = 120, [240] = 120,
+    -- BRD
+    [376] = 30, [463] = 30, [421] = 216, [422] = 216,
+    [454] = 78, [455] = 78, [456] = 78, [457] = 78, [458] = 78, [459] = 78, [460] = 78, [461] = 78,
+    [368] = 120, [369] = 120, [370] = 120, [371] = 120, [372] = 120, [373] = 120, [374] = 120, [375] = 120,
+    -- Helix
+    [278] = 90, [279] = 90, [280] = 90, [281] = 90, [282] = 90, [283] = 90, [284] = 90, [285] = 90,
+    [885] = 90, [886] = 90, [887] = 90, [888] = 90, [889] = 90, [890] = 90, [891] = 90, [892] = 90,
+}
+
+local bard_spell_duration = {
+    [368] = 120, [369] = 120, [370] = 120, [371] = 120, [372] = 120, [373] = 120, [374] = 120, [375] = 120, -- Requiem
+    [376] = 30,  [463] = 30,                                                                                   -- Lullaby
+    [421] = 216, [422] = 216,                                                                                  -- Elegy
+    [454] = 78,  [455] = 78,  [456] = 78,  [457] = 78,  [458] = 78,  [459] = 78,  [460] = 78,  [461] = 78,  -- Threnody
+}
+
+local spell_to_buff = {
+    [230] = 135, [23] = 134, [24] = 134, [25] = 134,
+    [58] = 4, [80] = 4, [56] = 13, [79] = 13, [357] = 13,
+    [216] = 12, [217] = 12, [254] = 5, [276] = 5, [361] = 5,
+    [59] = 6, [359] = 6, [253] = 2, [259] = 2, [273] = 2, [274] = 2,
+    [258] = 11, [362] = 11, [252] = 10,
+    [220] = 3, [221] = 3, [222] = 3, [223] = 3, [224] = 3, [225] = 3, [226] = 3, [227] = 3, [228] = 3, [229] = 3, [536] = 3,
+    [239] = 132, [238] = 131, [237] = 130, [236] = 129, [608] = 129, [235] = 128, [240] = 133,
+    [421] = 194, [422] = 194, [423] = 194,
+    [368] = 192, [369] = 192, [370] = 192, [371] = 192, [372] = 192, [373] = 192,
+    [463] = 193, [376] = 193,
+    [454] = 217, [455] = 217, [456] = 217, [457] = 217, [458] = 217, [459] = 217, [460] = 217, [461] = 217,
+    [278] = 186, [279] = 186, [280] = 186, [281] = 186, [282] = 186, [283] = 186, [284] = 186, [285] = 186,
+    [885] = 186, [886] = 186, [887] = 186, [888] = 186, [889] = 186, [890] = 186, [891] = 186, [892] = 186,
+}
+
+local spell_effects = {
+    [23] = {buff = 134, duration = 60, clear = 135, on_damage = true},     -- Dia
+    [24] = {buff = 134, duration = 120, clear = 135, on_damage = true},    -- Dia II
+    [25] = {buff = 134, duration = 150, clear = 135, on_damage = true},    -- Dia III
+    [33] = {buff = 134, duration = 60, clear = 135, on_damage = true},     -- Diaga
+    [230] = {buff = 135, duration = 60, clear = 134, on_damage = true},    -- Bio
+    [231] = {buff = 135, duration = 120, clear = 134, on_damage = true},   -- Bio II
+    [232] = {buff = 135, duration = 150, clear = 134, on_damage = true},   -- Bio III
+    [421] = {buff = 194, duration = 216},                                   -- Battlefield Elegy
+    [422] = {buff = 194, duration = 216},                                   -- Carnage Elegy
+    [278] = {buff = 186, duration = 90, on_damage = true},
+    [279] = {buff = 186, duration = 90, on_damage = true},
+    [280] = {buff = 186, duration = 90, on_damage = true},
+    [281] = {buff = 186, duration = 90, on_damage = true},
+    [282] = {buff = 186, duration = 90, on_damage = true},
+    [283] = {buff = 186, duration = 90, on_damage = true},
+    [284] = {buff = 186, duration = 90, on_damage = true},
+    [285] = {buff = 186, duration = 90, on_damage = true},
+    [885] = {buff = 186, duration = 90, on_damage = true},
+    [886] = {buff = 186, duration = 90, on_damage = true},
+    [887] = {buff = 186, duration = 90, on_damage = true},
+    [888] = {buff = 186, duration = 90, on_damage = true},
+    [889] = {buff = 186, duration = 90, on_damage = true},
+    [890] = {buff = 186, duration = 90, on_damage = true},
+    [891] = {buff = 186, duration = 90, on_damage = true},
+    [892] = {buff = 186, duration = 90, on_damage = true},
+}
+local negative_player_status = S{
+    2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 19, 28, 29, 30, 31, 128, 129, 130, 131, 132, 133, 134, 135,
+    136, 137, 138, 147, 148, 149, 156, 167, 186, 192, 193, 194, 387, 404
+}
+
+function M.is_negative_player_status(buff_id)
+    return negative_player_status:contains(buff_id)
+end
+
+function M.is_positive_player_status(buff_id)
+    return (tonumber(buff_id) or 0) > 0 and not negative_player_status:contains(buff_id)
+end
+
+function M.buff_name(buff_id)
+    local entry = res.buffs[buff_id]
+    if not entry then
+        return tostring(buff_id)
+    end
+    return entry.en or tostring(buff_id)
+end
+
+local function resolve_buff_id(act, action)
+    local action_type = act.category or act.type
+    local buff_id = action.param
+    -- Some packets put spell id in action.param; only accept as buff if it is a real buff id.
+    if buff_id and buff_id > 0 and buff_id <= 1024 and res.buffs[buff_id] then
+        return buff_id
+    end
+
+    local spell_id = act.param
+    if action_type == 4 and spell_id and spell_to_buff[spell_id] then
+        return spell_to_buff[spell_id]
+    end
+
+    if spell_id and spell_to_buff[spell_id] then
+        return spell_to_buff[spell_id]
+    end
+
+    return nil
+end
+
+local function resolve_duration(buff_id, spell_id)
+    if spell_id then
+        local s = res.spells[spell_id]
+        local d = s and tonumber(s.duration or 0) or 0
+        if d and d > 0 then
+            return d
+        end
+    end
+    if spell_id and spell_duration[spell_id] then
+        return spell_duration[spell_id]
+    end
+    if spell_id and bard_spell_duration[spell_id] then
+        return bard_spell_duration[spell_id]
+    end
+    if known_debuff_duration[buff_id] then
+        return known_debuff_duration[buff_id]
+    end
+    return 299
+end
+
+local function apply_debuff(state, tid, buff_id, duration, clear_buff, spell_id)
+    if not state.mob_debuffs[tid] then
+        state.mob_debuffs[tid] = {}
+    end
+    if clear_buff then
+        state.mob_debuffs[tid][clear_buff] = nil
+    end
+    state.mob_debuffs[tid][buff_id] = util.unix_now() + (duration or resolve_duration(buff_id, spell_id))
+end
+
+local function ensure_target_buffs(state, tid)
+    if not state.target_buffs then
+        state.target_buffs = {}
+    end
+    if not state.target_buffs[tid] then
+        state.target_buffs[tid] = {}
+    end
+    return state.target_buffs[tid]
+end
+
+local function set_target_buff(state, tid, buff_id)
+    if not tid or not buff_id or buff_id <= 0 then
+        return
+    end
+    local bset = ensure_target_buffs(state, tid)
+    bset[buff_id] = util.unix_now()
+end
+
+local function clear_target_buff(state, tid, buff_id)
+    if not state.target_buffs or not state.target_buffs[tid] or not buff_id then
+        return
+    end
+    state.target_buffs[tid][buff_id] = nil
+end
+
+function M.apply_action(state, act, settings, windower_ref)
+    if not act or not act.targets then
+        return
+    end
+
+    local spell_id = act.param
+    local effect = spell_id and spell_effects[spell_id] or nil
+    for _, target in ipairs(act.targets) do
+        local tid = target.id
+        if tid and target.actions then
+            for _, action in ipairs(target.actions) do
+                local message = action.message
+
+                if death_messages:contains(message) then
+                    state.mob_debuffs[tid] = nil
+                    if state.target_buffs then
+                        state.target_buffs[tid] = nil
+                    end
+                elseif effect and effect.on_damage and spell_damage_messages:contains(message) then
+                    apply_debuff(state, tid, effect.buff, effect.duration, effect.clear, spell_id)
+                elseif status_on_messages:contains(message) then
+                    local buff_id = resolve_buff_id(act, action)
+                    local duration = nil
+                    local clear = nil
+                    if spell_id and spell_duration[spell_id] then
+                        duration = spell_duration[spell_id]
+                    end
+                    if effect and effect.buff and (not buff_id) then
+                        buff_id = effect.buff
+                    end
+                    if effect and effect.buff and buff_id == effect.buff then
+                        duration = effect.duration
+                        clear = effect.clear
+                    end
+                    if buff_id then
+                        if duration == nil and effect == nil then
+                            -- Match XIUI fallback for unknown status effects.
+                            duration = 300
+                        end
+                        apply_debuff(state, tid, buff_id, duration, clear, spell_id)
+                        if M.is_positive_player_status(buff_id) then
+                            set_target_buff(state, tid, buff_id)
+                        end
+                    end
+                elseif status_off_messages:contains(message) then
+                    local buff_id = resolve_buff_id(act, action)
+                    clear_target_buff(state, tid, buff_id)
+                    if buff_id and state.mob_debuffs[tid] then
+                        state.mob_debuffs[tid][buff_id] = nil
+                    end
+                end
+            end
+        end
+    end
+end
+
+function M.apply_basic_message(state, basic, windower_ref)
+    if not basic then
+        return
+    end
+
+    local target_id = basic.target_id or basic.target
+    local message_id = basic.message_id or basic.message
+    local buff_id = basic.param or basic.param_1 or basic.value
+    if not target_id or not message_id then
+        return
+    end
+
+    if death_messages:contains(message_id) then
+        state.mob_debuffs[target_id] = nil
+        if state.target_buffs then
+            state.target_buffs[target_id] = nil
+        end
+        return
+    end
+
+    if not state.mob_debuffs[target_id] then
+        return
+    end
+
+    if message_id == 321 then
+        local v = basic.value or buff_id
+        if v then
+            state.mob_debuffs[target_id][v] = nil
+            clear_target_buff(state, target_id, v)
+        end
+        return
+    end
+
+    if not status_off_messages:contains(message_id) then
+        return
+    end
+
+    if buff_id == 2 then
+        state.mob_debuffs[target_id][2] = nil
+        state.mob_debuffs[target_id][193] = nil
+        state.mob_debuffs[target_id][19] = nil
+        clear_target_buff(state, target_id, 2)
+        clear_target_buff(state, target_id, 193)
+        clear_target_buff(state, target_id, 19)
+    elseif buff_id then
+        state.mob_debuffs[target_id][buff_id] = nil
+        clear_target_buff(state, target_id, buff_id)
+    end
+end
+
+function M.clear_expired(state)
+    local t = util.unix_now()
+    for mob_id, debuffs in pairs(state.mob_debuffs) do
+        local has_any = false
+        for buff_id, expires in pairs(debuffs) do
+            if expires <= t then
+                debuffs[buff_id] = nil
+            else
+                has_any = true
+            end
+        end
+        if not has_any then
+            state.mob_debuffs[mob_id] = nil
+        end
+    end
+end
+
+function M.get_active_names(state, mob_id, max_items)
+    local dset = state.mob_debuffs[mob_id]
+    if not dset then
+        return {'-'}
+    end
+
+    local t = util.unix_now()
+    local names = {}
+    local seen = {}
+    for buff_id, expires in pairs(dset) do
+        if expires > t then
+            local name = M.buff_name(buff_id)
+            if not seen[name] then
+                seen[name] = true
+                names[#names + 1] = name
+            end
+        end
+    end
+
+    if #names == 0 then
+        return {'-'}
+    end
+
+    table.sort(names)
+    return util.shorten(names, max_items or 4)
+end
+
+function M.get_active_ids(state, mob_id, max_items)
+    local dset = state.mob_debuffs[mob_id]
+    if not dset then
+        return {}
+    end
+
+    local t = util.unix_now()
+    local ids = {}
+    for buff_id, expires in pairs(dset) do
+        if expires > t then
+            ids[#ids + 1] = buff_id
+        end
+    end
+
+    table.sort(ids, function(a, b)
+        local na = M.buff_name(a)
+        local nb = M.buff_name(b)
+        if na ~= nb then
+            return na < nb
+        end
+        return a < b
+    end)
+
+    if max_items and #ids > max_items then
+        local out = {}
+        for i = 1, max_items do
+            out[i] = ids[i]
+        end
+        return out
+    end
+
+    return ids
+end
+
+function M.get_active_entries(state, mob_id, max_items)
+    local dset = state.mob_debuffs[mob_id]
+    if not dset then
+        return {}
+    end
+
+    local t = util.unix_now()
+    local entries = {}
+    for buff_id, expires in pairs(dset) do
+        if expires > t then
+            entries[#entries + 1] = {
+                id = buff_id,
+                remaining = math.max(0, expires - t),
+                name = M.buff_name(buff_id),
+            }
+        end
+    end
+
+    table.sort(entries, function(a, b)
+        if a.name ~= b.name then
+            return a.name < b.name
+        end
+        return a.id < b.id
+    end)
+
+    if max_items and #entries > max_items then
+        local out = {}
+        for i = 1, max_items do
+            out[i] = entries[i]
+        end
+        return out
+    end
+
+    return entries
+end
+
+function M.get_known_target_buffs(state, mob_id, max_items)
+    if not state.target_buffs then
+        return {}
+    end
+    local bset = state.target_buffs[mob_id]
+    if not bset then
+        return {}
+    end
+
+    local out = {}
+    for buff_id, seen_at in pairs(bset) do
+        if M.is_positive_player_status(buff_id) then
+            out[#out + 1] = {
+                id = buff_id,
+                name = M.buff_name(buff_id),
+                seen_at = tonumber(seen_at) or 0,
+            }
+        end
+    end
+
+    table.sort(out, function(a, b)
+        if a.seen_at ~= b.seen_at then
+            return a.seen_at > b.seen_at
+        end
+        if a.name ~= b.name then
+            return a.name < b.name
+        end
+        return a.id < b.id
+    end)
+
+    if max_items and #out > max_items then
+        local trimmed = {}
+        for i = 1, max_items do
+            trimmed[i] = out[i]
+        end
+        return trimmed
+    end
+    return out
+end
+
+return M

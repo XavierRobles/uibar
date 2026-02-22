@@ -1,0 +1,45 @@
+return {
+    enabled = true,
+    drag_locked = false,
+    update_interval = 0.15,
+    max_enemies = 8,
+    enemy_scan_range = 0,
+    main = {
+        x = 25,
+        y = 20,
+        width = 66,
+        max_buffs = 10,
+        max_debuffs = 6,
+        bg_alpha = 205,
+    },
+    target = {
+        x = 25,
+        y = 125,
+        width = 66,
+        bg_alpha = 205,
+    },
+    enemy = {
+        x = 25,
+        y = 180,
+        width = 95,
+        bg_alpha = 205,
+        max_debuffs_per_enemy = 4,
+    },
+    graphics = {
+        enabled = true,
+        bar = {
+            x_offset = 220,
+            width = 500,
+            height = 10,
+            gap = 16,
+        },
+        icons = {
+            size = 22,
+            spacing = 2,
+            per_row = 14,
+            max_player_buffs = 16,
+            max_player_debuffs = 10,
+            max_target_debuffs = 14,
+        },
+    },
+}
