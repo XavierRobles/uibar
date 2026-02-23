@@ -1,6 +1,6 @@
 _addon.name = 'uibar'
 _addon.author = 'Xavie'
-_addon.version = '0.2.0'
+_addon.version = '0.2.1'
 _addon.commands = {'uibar', 'ub'}
 
 require('strings')
@@ -14,6 +14,7 @@ local util = require('uibarutil')
 local debuffs = require('uibardebuffs')
 local status = require('uibarstatus')
 local actiontracker = require('uibaractiontracker')
+local actionparse = require('uibarpacketparse')
 local mobdb = require('uibarmobdb')
 local renderer = require('uibarrender')
 local panels_mod = require('uibarpanels')
@@ -24,8 +25,14 @@ local settings = config.load(defaults)
 local state = {
     last_update = 0,
     mob_debuffs = {},
+    mob_debuff_marks = {},
     target_buffs = {},
     mob_debuff_spell = {},
+    mob_party_touch = {},
+    enemy_target_cache = {},
+    enemy_rows_cache = {},
+    enemy_rows_next_at = 0,
+    retail_debug = true,
     last_drag_save = 0,
     mouse_x = 0,
     mouse_y = 0,
@@ -64,6 +71,59 @@ local function save()
     config.save(settings)
 end
 
+local cc_spell_debug = {
+    [253] = true, [273] = true, [363] = true, -- Sleep/Sleepga/Sleepga II
+    [259] = true, [274] = true, [364] = true, -- Sleep II/Sleepga II/Sleepga III
+    [376] = true, [377] = true,               -- Foe Lullaby I/II
+    [463] = true, [464] = true,               -- Horde Lullaby I/II
+}
+
+local cc_buff_debug = {
+    [2] = true, [19] = true, [193] = true,
+}
+
+local function packet_spell_id(pkt)
+    return tonumber((pkt and (pkt.Param or pkt.param or pkt.Param_1 or pkt.param_1)) or 0) or 0
+end
+
+local function packet_type(pkt)
+    return tonumber((pkt and (pkt.Type or pkt.type or pkt.category)) or 0) or 0
+end
+
+local function summarize_targets(pkt)
+    local ts = pkt and (pkt.targets or pkt.Targets)
+    if type(ts) ~= 'table' then
+        return 0, '-'
+    end
+    local count = 0
+    local out = {}
+    for _, t in pairs(ts) do
+        local tid = tonumber((t and (t.id or t.Id)) or 0) or 0
+        if tid > 0 then
+            count = count + 1
+            if #out < 6 then
+                local acts = t.actions or t.Actions
+                local ac = 0
+                local msg = 0
+                local prm = 0
+                if type(acts) == 'table' then
+                    for _, a in pairs(acts) do
+                        ac = ac + 1
+                        if msg == 0 then
+                            msg = tonumber((a and (a.Message or a.message)) or 0) or 0
+                            prm = tonumber((a and (a.Param or a.param)) or 0) or 0
+                        end
+                    end
+                end
+                local m = windower.ffxi.get_mob_by_id(tid)
+                local nm = tostring((m and m.name) or '?')
+                out[#out + 1] = string.format('%s[%d]a%d m%d p%d', nm, tid, ac, msg, prm)
+            end
+        end
+    end
+    return count, (#out > 0 and table.concat(out, ' | ') or '-')
+end
+
 local function update_drag_ui()
     local unlocked = (not settings.drag_locked) and settings.enabled and settings.graphics.enabled
     drag_anchor:draggable(false)
@@ -71,6 +131,9 @@ local function update_drag_ui()
 
     if gstate and gstate.target_hp and gstate.target_hp.bg then
         gstate.target_hp.bg:draggable(unlocked)
+    end
+    if gstate and gstate.enemy_drag then
+        gstate.enemy_drag:draggable(unlocked)
     end
 end
 
@@ -87,7 +150,6 @@ local function render()
     if not settings.graphics.enabled then
         panels.enemy:text(renderer.format_enemy_list(settings, state))
     end
-    graphics.update(gstate, settings, state, mobdb, state.mouse_x, state.mouse_y)
     update_drag_ui()
 end
 
@@ -97,6 +159,16 @@ local function reset_positions()
 end
 
 windower.register_event('load', function()
+    if (tonumber(settings.target.x) or 0) < 0 or (tonumber(settings.target.y) or 0) < 0 then
+        settings.target.x = defaults.target.x
+        settings.target.y = defaults.target.y
+        save()
+    end
+    if (tonumber(settings.enemy.x) or 0) < 0 or (tonumber(settings.enemy.y) or 0) < 0 or (tonumber(settings.enemy.y) or 0) > 1200 then
+        settings.enemy.x = defaults.enemy.x
+        settings.enemy.y = defaults.enemy.y
+        save()
+    end
     mobdb.on_zone_change()
     status.clear()
     actiontracker.clear()
@@ -106,8 +178,13 @@ end)
 
 windower.register_event('zone change', function()
     state.mob_debuffs = {}
+    state.mob_debuff_marks = {}
     state.target_buffs = {}
     state.mob_debuff_spell = {}
+    state.mob_party_touch = {}
+    state.enemy_target_cache = {}
+    state.enemy_rows_cache = {}
+    state.enemy_rows_next_at = 0
     mobdb.on_zone_change()
     status.clear()
     actiontracker.clear()
@@ -115,12 +192,40 @@ end)
 
 windower.register_event('action', function(act)
     actiontracker.handle_action(act)
-    debuffs.apply_action(state, act, settings, windower)
 end)
 
 windower.register_event('incoming chunk', function(id, data)
     if not data then
         return
+    end
+    if id == 0x028 then
+        local p = windower and windower.packets and windower.packets.parse_action and windower.packets.parse_action(data) or nil
+        local a = packets.parse('incoming', data)
+        local b = actionparse.parse_action_packet(data)
+        if state.retail_debug then
+            local sp = packet_spell_id(p)
+            local sa = packet_spell_id(a)
+            local sb = packet_spell_id(b)
+            if cc_spell_debug[sp] or cc_spell_debug[sa] or cc_spell_debug[sb] then
+                local cp, dp = summarize_targets(p)
+                local ca, da = summarize_targets(a)
+                local cb, db = summarize_targets(b)
+                windower.add_to_chat(123, string.format('[uibar][rdbg028] P(sp=%d ty=%d t=%d) %s || A(sp=%d ty=%d t=%d) %s || B(sp=%d ty=%d t=%d) %s',
+                    sp, packet_type(p), cp, dp,
+                    sa, packet_type(a), ca, da,
+                    sb, packet_type(b), cb, db))
+            end
+        end
+        if p then
+            debuffs.apply_action(state, p, settings, windower)
+        else
+            if a then
+                debuffs.apply_action(state, a, settings, windower)
+            end
+            if b then
+                debuffs.apply_action(state, b, settings, windower)
+            end
+        end
     end
     actiontracker.handle_chunk(id, data, packets)
     status.handlechunk(id, data, packets)
@@ -128,36 +233,72 @@ windower.register_event('incoming chunk', function(id, data)
         return
     end
     local p = packets.parse('incoming', data)
+    local raw_msg = p and (p.Message or p['Message ID'] or p.message_id) or data:unpack('H', 0x19)
     local basic = {
+        actor_id = p and (p.Actor or p['Actor ID'] or p.actor_id or p.User or p['Source ID']) or data:unpack('I', 0x05),
         target_id = p and (p.Target or p['Target ID'] or p.target_id) or data:unpack('I', 0x09),
         param_1 = p and (p.Param_1 or p['Param 1'] or p.param_1) or data:unpack('I', 0x0D),
         param = p and (p.Param or p.param) or data:unpack('I', 0x0D),
         value = p and (p.Value or p.value) or data:unpack('I', 0x11),
-        message_id = p and (p.Message or p['Message ID'] or p.message_id) or (data:unpack('H', 0x19) % 32768),
+        message_id = (tonumber(raw_msg or 0) or 0) % 32768,
     }
+    if state.retail_debug then
+        local b = tonumber(basic.param or basic.param_1 or basic.value or 0) or 0
+        if cc_buff_debug[b] then
+            local tm = windower.ffxi.get_mob_by_id(tonumber(basic.target_id or 0) or 0)
+            local am = windower.ffxi.get_mob_by_id(tonumber(basic.actor_id or 0) or 0)
+            windower.add_to_chat(123, string.format('[uibar][rdbg029] msg=%d buff=%d actor=%d(%s) target=%d(%s)',
+                tonumber(basic.message_id or 0) or 0,
+                b,
+                tonumber(basic.actor_id or 0) or 0, tostring((am and am.name) or '?'),
+                tonumber(basic.target_id or 0) or 0, tostring((tm and tm.name) or '?')))
+        end
+    end
     debuffs.apply_basic_message(state, basic, windower)
 end)
 
 windower.register_event('prerender', function()
     local t = util.frame_now()
     if settings.enabled and settings.graphics.enabled and (not settings.drag_locked) then
-        local bx, by = gstate.target_hp.bg:pos()
-        if bx and by then
-            local tx = math.floor(bx)
-            local ty = math.floor(by - 18)
-            if tx ~= settings.target.x or ty ~= settings.target.y then
-                settings.target.x = tx
-                settings.target.y = ty
-                if t - state.last_drag_save > 0.5 then
-                    save()
-                    state.last_drag_save = t
+        local target_bar_visible = false
+        if gstate and gstate.target_hp and gstate.target_hp.bg and gstate.target_hp.bg.visible then
+            target_bar_visible = gstate.target_hp.bg:visible()
+        end
+        if target_bar_visible then
+            local bx, by = gstate.target_hp.bg:pos()
+            if bx and by then
+                local tx = math.floor(bx)
+                local ty = math.floor(by - 18)
+                if tx ~= settings.target.x or ty ~= settings.target.y then
+                    settings.target.x = tx
+                    settings.target.y = ty
+                    if t - state.last_drag_save > 0.5 then
+                        save()
+                        state.last_drag_save = t
+                    end
+                end
+            end
+        end
+
+        if gstate and gstate.enemy_drag and gstate.enemy_drag:visible() then
+            local ex, ey = gstate.enemy_drag:pos()
+            if ex and ey then
+                local nx = math.floor(ex)
+                local ny = math.floor(ey + 10)
+                if nx ~= settings.enemy.x or ny ~= settings.enemy.y then
+                    settings.enemy.x = nx
+                    settings.enemy.y = ny
+                    if t - state.last_drag_save > 0.5 then
+                        save()
+                        state.last_drag_save = t
+                    end
                 end
             end
         end
     end
 
     -- Keep graphical animations smooth by updating them every frame.
-    if settings.enabled then
+    if settings.enabled and settings.graphics.enabled then
         graphics.update(gstate, settings, state, mobdb, state.mouse_x, state.mouse_y)
     else
         graphics.hide(gstate)

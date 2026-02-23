@@ -5,6 +5,7 @@ local debuffs = require('uibardebuffs')
 local party = require('uibarparty')
 local status = require('uibarstatus')
 local actiontracker = require('uibaractiontracker')
+local util = require('uibarutil')
 
 local M = {}
 
@@ -102,7 +103,7 @@ local function make_small_text(color)
         pos = {x = 0, y = 0},
         text = {
             font = 'Consolas',
-            size = 9,
+            size = 8,
             alpha = 255,
             red = color[1],
             green = color[2],
@@ -376,6 +377,16 @@ local function make_timer_text()
     return t
 end
 
+local function debuff_tier_label(buff_id, mark)
+    if type(mark) == 'string' and mark ~= '' then
+        return mark
+    end
+    if tonumber(buff_id or 0) == 19 then
+        return '2' -- Sleep II
+    end
+    return nil
+end
+
 local function make_tooltip_text()
     local t = texts.new('', {
         pos = {x = 0, y = 0},
@@ -593,7 +604,7 @@ local function format_remaining(remaining)
     return tostring(r)
 end
 
-local function show_icon_grid(state, icon_pool, timer_pool, entries, x, y, size, spacing, limit, per_row, show_timers)
+local function show_icon_grid(state, icon_pool, timer_pool, mark_pool, entries, x, y, size, spacing, limit, per_row, show_timers)
     limit = limit or #entries
     show_timers = (show_timers ~= false)
     per_row = math.max(1, per_row or limit)
@@ -603,6 +614,7 @@ local function show_icon_grid(state, icon_pool, timer_pool, entries, x, y, size,
     local shown = 0
     ensure_pool(icon_pool, math.min(limit, #entries))
     ensure_text_pool(timer_pool, math.min(limit, #entries))
+    ensure_text_pool(mark_pool, math.min(limit, #entries))
     for i = 1, math.min(limit, #entries) do
         local entry = entries[i]
         local id = entry.id
@@ -630,6 +642,17 @@ local function show_icon_grid(state, icon_pool, timer_pool, entries, x, y, size,
             else
                 timer:hide()
             end
+
+            local mark = mark_pool[shown]
+            local lbl = debuff_tier_label(id, entry.mark)
+            if mark and lbl then
+                mark:text(lbl)
+                pcall(function() mark:color(250, 220, 90) end)
+                mark:pos(px + size - 6, py + size - 8)
+                mark:show()
+            elseif mark then
+                mark:hide()
+            end
         end
     end
 
@@ -638,6 +661,9 @@ local function show_icon_grid(state, icon_pool, timer_pool, entries, x, y, size,
     end
     for i = shown + 1, #timer_pool do
         timer_pool[i]:hide()
+    end
+    for i = shown + 1, #mark_pool do
+        mark_pool[i]:hide()
     end
     for i = shown + 1, #state.visible_icon_entries do
         state.visible_icon_entries[i] = nil
@@ -664,6 +690,8 @@ local function ensure_enemy_row(state, idx)
             info = make_small_text({215, 215, 215}),
             tot = make_small_text({190, 220, 255}),
             icons = {},
+            itimes = {},
+            imarks = {},
         }
     end
     return state.enemy_rows[idx]
@@ -677,16 +705,26 @@ local function hide_enemy_rows(state)
         row.info:hide()
         row.tot:hide()
         hide_pool(row.icons)
+        hide_text_pool(row.itimes)
+        hide_text_pool(row.imarks)
     end
     state.enemy_title:hide()
+    if state.enemy_drag then
+        state.enemy_drag:hide()
+    end
 end
 
 function M.create(settings)
     local addon_path = windower.addon_path or ''
     local targetjobicon = images.new('uibar_targetjobicon')
+    local enemydrag = images.new('uibar_enemy_drag')
     targetjobicon:draggable(false)
     targetjobicon:fit(false)
     targetjobicon:hide()
+    enemydrag:draggable(false)
+    enemydrag:fit(true)
+    enemydrag:alpha(0)
+    enemydrag:hide()
     return {
         icon_root = addon_path .. 'images/icons/',
         icon_path_cache = {},
@@ -700,11 +738,13 @@ function M.create(settings)
         job_icon_cache = {},
         target_debuffs = {},
         target_debuff_times = {},
+        target_debuff_marks = {},
         target_detect_icons = {},
         detect_icon_cache = {},
         visible_icon_entries = {},
         visible_detect_entries = {},
         visible_job_entry = nil,
+        enemy_drag = enemydrag,
         enemy_title = make_small_text({235, 235, 235}),
         enemy_rows = {},
         anim = {
@@ -730,6 +770,7 @@ function M.hide(state)
     state.target_job_icon:hide()
     hide_pool(state.target_debuffs)
     hide_text_pool(state.target_debuff_times)
+    hide_text_pool(state.target_debuff_marks)
     hide_pool(state.target_detect_icons)
     hide_enemy_rows(state)
 end
@@ -760,7 +801,11 @@ function M.destroy(state)
     for i = 1, #state.target_debuff_times do
         pcall(function() state.target_debuff_times[i]:destroy() end)
     end
+    for i = 1, #state.target_debuff_marks do
+        pcall(function() state.target_debuff_marks[i]:destroy() end)
+    end
     pcall(function() state.enemy_title:destroy() end)
+    pcall(function() state.enemy_drag:destroy() end)
     for i = 1, #state.enemy_rows do
         local row = state.enemy_rows[i]
         if row then
@@ -773,6 +818,12 @@ function M.destroy(state)
             pcall(function() row.tot:destroy() end)
             for k = 1, #row.icons do
                 pcall(function() row.icons[k]:destroy() end)
+            end
+            for k = 1, #row.itimes do
+                pcall(function() row.itimes[k]:destroy() end)
+            end
+            for k = 1, #row.imarks do
+                pcall(function() row.imarks[k]:destroy() end)
             end
         end
     end
@@ -968,22 +1019,50 @@ local function update_tooltip(state, mouse_x, mouse_y)
     state.tooltip:show()
 end
 
-local function collect_enemy_aggro_rows(settings, mobdb)
+local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids, ally_ids, all_ids)
     local mobs = windower.ffxi.get_mob_array()
     if not mobs then
         return {}
     end
-    local party_ids, ally_ids, all_ids = party.get_claim_sets()
+    logic_state = logic_state or {}
+    if not party_ids or not ally_ids or not all_ids then
+        party_ids, ally_ids, all_ids = party.get_claim_sets()
+    end
+    logic_state.enemy_target_cache = logic_state.enemy_target_cache or {}
+    local cache = logic_state.enemy_target_cache
+    local now_ts = os.time()
+    local now_u = util.unix_now()
+    local max_visible_sq = 50 * 50
+    local no_target_clear_secs = 8
+    local party_touch_grace_secs = 45
+
     local rows = {}
-    local scan_sq = (settings.enemy_scan_range or 0) * (settings.enemy_scan_range or 0)
 
     for _, mob in pairs(mobs) do
         if mob and mob.is_npc and mob.valid_target and tonumber(mob.hpp or 0) > 0 and mob.distance then
-            local within = (settings.enemy_scan_range or 0) <= 0 or mob.distance <= scan_sq
+            local mid = tonumber(mob.id or 0) or 0
+            local within = mob.distance <= max_visible_sq
+            if not within and mid > 0 then
+                cache[mid] = nil
+                if logic_state.mob_party_touch then
+                    logic_state.mob_party_touch[mid] = nil
+                end
+            end
             if within then
                 local tgt = get_target_of_target(mob)
                 local tid = tonumber(tgt and tgt.id or 0) or 0
+                local touched_at = logic_state.mob_party_touch and tonumber(logic_state.mob_party_touch[mid] or 0) or 0
+                local party_touch_recent = touched_at > 0 and (now_u - touched_at) <= party_touch_grace_secs
+
                 if tid > 0 and all_ids and all_ids[tid] then
+                    if mid > 0 then
+                        cache[mid] = {
+                            id = tid,
+                            name = tostring(tgt.name or ''),
+                            seen_at = now_ts,
+                            last_target_at = now_ts,
+                        }
+                    end
                     local info = mobdb and mobdb.get_mob_info and mobdb.get_mob_info(mob) or nil
                     rows[#rows + 1] = {
                         mob = mob,
@@ -994,6 +1073,79 @@ local function collect_enemy_aggro_rows(settings, mobdb)
                         party_ids = party_ids,
                         ally_ids = ally_ids,
                     }
+                elseif party_touch_recent then
+                    local c = cache[mid]
+                    rows[#rows + 1] = {
+                        mob = mob,
+                        info = mobdb and mobdb.get_mob_info and mobdb.get_mob_info(mob) or nil,
+                        target = c and {
+                            id = tonumber(c.id or 0) or 0,
+                            name = c.name or '',
+                            is_npc = false,
+                        } or nil,
+                        distance = math.sqrt(math.max(0, mob.distance or 0)),
+                        hpp = tonumber(mob.hpp or 0) or 0,
+                        party_ids = party_ids,
+                        ally_ids = ally_ids,
+                    }
+                elseif tid > 0 and mid > 0 then
+                    -- Mob currently targets someone outside party/alliance: treat as hate lost.
+                    cache[mid] = nil
+                elseif mid > 0 then
+                    local c = cache[mid]
+                    if c and all_ids and all_ids[tonumber(c.id or 0) or 0] then
+                        -- If mob has no visible target and no claim for a while, consider hate lost.
+                        local claim_id = tonumber(mob.claim_id or 0) or 0
+                        local last_target_at = tonumber(c.last_target_at or c.seen_at or now_ts) or now_ts
+                        if claim_id == 0 and (now_ts - last_target_at) > no_target_clear_secs then
+                            cache[mid] = nil
+                        else
+                            c.seen_at = now_ts
+                            cache[mid] = c
+                            local info = mobdb and mobdb.get_mob_info and mobdb.get_mob_info(mob) or nil
+                            rows[#rows + 1] = {
+                                mob = mob,
+                                info = info,
+                                target = {
+                                    id = tonumber(c.id or 0) or 0,
+                                    name = c.name or '',
+                                    is_npc = false,
+                                },
+                                distance = math.sqrt(math.max(0, mob.distance or 0)),
+                                hpp = tonumber(mob.hpp or 0) or 0,
+                                party_ids = party_ids,
+                                ally_ids = ally_ids,
+                            }
+                        end
+                    else
+                        cache[mid] = nil
+                    end
+                end
+            end
+        elseif mob and mob.is_npc and tonumber(mob.id or 0) and tonumber(mob.id or 0) > 0 then
+            -- Dead or invalid mobs should be removed from cache.
+            local dead_id = tonumber(mob.id)
+            cache[dead_id] = nil
+            if logic_state.mob_party_touch then
+                logic_state.mob_party_touch[dead_id] = nil
+            end
+        end
+    end
+
+    -- Cleanup cache entries that no longer have a corresponding visible mob entity.
+    do
+        local alive = {}
+        for _, mob in pairs(mobs) do
+            local mid = tonumber(mob and mob.id or 0) or 0
+            if mid > 0 and mob.is_npc and mob.valid_target and tonumber(mob.hpp or 0) > 0 and mob.distance and mob.distance <= max_visible_sq then
+                alive[mid] = true
+            end
+        end
+        for mid, _ in pairs(cache) do
+            if not alive[mid] then
+                cache[mid] = nil
+                if logic_state.mob_party_touch then
+                    logic_state.mob_party_touch[mid] = nil
                 end
             end
         end
@@ -1028,6 +1180,7 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
 
     local bar_cfg = settings.graphics.bar
     local icon_cfg = settings.graphics.icons
+    local party_ids, ally_ids, all_ids = party.get_claim_sets()
     local now = os.clock()
     local dt = now - (state.anim.last_clock or now)
     state.anim.last_clock = now
@@ -1085,7 +1238,6 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         end
         local is_npc = target.is_npc and true or false
         local info = (is_npc and mobdb and mobdb.get_mob_info) and mobdb.get_mob_info(target) or nil
-        local party_ids, ally_ids = party.get_claim_sets()
         local nr, ng, nb = target_name_color(target, party_ids, ally_ids, info)
         local lvl = (is_npc and mobdb and mobdb.level_string) and mobdb.level_string(info) or nil
         local job = (is_npc and mobdb and mobdb.job_string) and mobdb.job_string(info) or nil
@@ -1208,6 +1360,7 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
             state,
             state.target_debuffs,
             state.target_debuff_times,
+            state.target_debuff_marks,
             entries,
             tbar_x,
             tbar_y + bar_cfg.height + 8,
@@ -1238,19 +1391,29 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         state.anim.heal_flash_timer = 0
     end
 
-    -- Enemy list (graphical): only mobs with aggro on party/alliance.
-    local erows = collect_enemy_aggro_rows(settings, mobdb)
+    -- Enemy list (graphical): cache expensive mob scan briefly to reduce per-frame load.
+    local enemy_refresh = 0.12
+    logic_state.enemy_rows_cache = logic_state.enemy_rows_cache or {}
+    if now >= (logic_state.enemy_rows_next_at or 0) then
+        logic_state.enemy_rows_cache = collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids, ally_ids, all_ids)
+        logic_state.enemy_rows_next_at = now + enemy_refresh
+    end
+    local erows = logic_state.enemy_rows_cache
     local ex = settings.enemy.x
     local ey = settings.enemy.y
-    local ew = math.max(220, math.floor((bar_cfg.width or 500) * 0.62))
-    local eh = math.max(7, math.floor((bar_cfg.height or 10) * 0.9))
-    local row_gap = eh + 28
+    local ew = math.max(115, math.floor((bar_cfg.width or 500) * 0.30))
+    local eh = math.max(5, math.floor((bar_cfg.height or 10) * 0.60))
     local icon_size = math.max(12, math.floor((icon_cfg.size or 22) * 0.62))
+    local row_gap = eh + icon_size + 31
     local icon_gap = 1
 
-    state.enemy_title:text(string.format('ENEMY LIST (%d)', #erows))
-    state.enemy_title:pos(ex, ey - 14)
-    state.enemy_title:show()
+    state.enemy_title:hide()
+    if state.enemy_drag then
+        local drag_h = math.max(22, 8 + (#erows * row_gap))
+        state.enemy_drag:pos(ex, ey - 10)
+        state.enemy_drag:size(ew + 240, drag_h)
+        state.enemy_drag:show()
+    end
 
     for i = 1, #erows do
         local e = erows[i]
@@ -1258,24 +1421,24 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         local y = ey + (i - 1) * row_gap
 
         local mr, mg, mb = health_color(e.hpp)
-        set_bar(row.hp, ex, y + 10, ew, eh, e.hpp, 100, mr, mg, mb)
+        set_bar(row.hp, ex, y + 9, ew, eh, e.hpp, 100, mr, mg, mb)
 
         local nr, ng, nb = target_name_color(e.mob, e.party_ids, e.ally_ids, e.info)
         row.name:text(short_name(e.mob.name or 'Mob', 30))
         pcall(function() row.name:color(nr, ng, nb) end)
-        row.name:pos(ex, y - 2)
+        row.name:pos(ex, y - 8)
         row.name:show()
 
         row.info:text(string.format('%d%%  %.1f', e.hpp, e.distance))
         local iw = row.info:extents() or 64
-        row.info:pos(ex + ew - iw, y - 2)
+        row.info:pos(ex + ew - iw, y - 8)
         row.info:show()
 
         if e.target and e.target.name and e.target.name ~= '' then
             local tr, tg, tb = target_name_color(e.target, e.party_ids, e.ally_ids, nil)
-            row.tot:text('-> ' .. short_name(e.target.name, 18))
+            row.tot:text('-> ' .. short_name(e.target.name, 14))
             pcall(function() row.tot:color(tr, tg, tb) end)
-            row.tot:pos(ex + ew + 8, y - 2)
+            row.tot:pos(ex + ew + 8, y - 8)
             row.tot:show()
         else
             row.tot:hide()
@@ -1285,21 +1448,55 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         sort_target_debuff_entries(dents)
         local max_icons = math.min(#dents, settings.enemy.max_debuffs_per_enemy or 4)
         ensure_pool(row.icons, max_icons)
+        ensure_text_pool(row.itimes, max_icons)
+        ensure_text_pool(row.imarks, max_icons)
         local shown = 0
         for j = 1, max_icons do
-            local did = dents[j].id
+            local de = dents[j]
+            local did = de.id
             local p = icon_path(state, did)
             if p then
                 shown = shown + 1
                 local ic = row.icons[shown]
                 ic:path(p)
                 ic:size(icon_size, icon_size)
-                ic:pos(ex + (shown - 1) * (icon_size + icon_gap), y + eh + 13)
+                local ix = ex + (shown - 1) * (icon_size + icon_gap)
+                local iy = y + eh + 12
+                ic:pos(ix, iy)
                 ic:show()
+
+                local rt = tonumber(de.remaining or 0) or 0
+                local tt = row.itimes[shown]
+                if rt > 0 then
+                    local txt = (rt >= 99) and '1+' or tostring(math.floor(rt + 0.5))
+                    tt:text(txt)
+                    local tw = tt:extents() or (#txt * 5)
+                    tt:pos(ix + math.floor((icon_size - tw) * 0.5), iy + icon_size)
+                    tt:show()
+                else
+                    tt:hide()
+                end
+
+                local mk = row.imarks[shown]
+                local ml = debuff_tier_label(did, de.mark)
+                if mk and ml then
+                    mk:text(ml)
+                    pcall(function() mk:color(250, 220, 90) end)
+                    mk:pos(ix + icon_size - 6, iy + icon_size - 8)
+                    mk:show()
+                elseif mk then
+                    mk:hide()
+                end
             end
         end
         for j = shown + 1, #row.icons do
             row.icons[j]:hide()
+        end
+        for j = shown + 1, #row.itimes do
+            row.itimes[j]:hide()
+        end
+        for j = shown + 1, #row.imarks do
+            row.imarks[j]:hide()
         end
     end
 
@@ -1310,6 +1507,8 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         row.info:hide()
         row.tot:hide()
         hide_pool(row.icons)
+        hide_text_pool(row.itimes)
+        hide_text_pool(row.imarks)
     end
 end
 

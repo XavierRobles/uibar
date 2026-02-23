@@ -47,6 +47,10 @@
     </global>
     <arkys>
         <drag_locked>true</drag_locked>
+        <enemy>
+            <x>30</x>
+            <y>242</y>
+        </enemy>
         <target>
             <x>652</x>
             <y>684</y>
@@ -54,6 +58,10 @@
     </arkys>
     <atenelis>
         <drag_locked>true</drag_locked>
+        <enemy>
+            <x>30</x>
+            <y>242</y>
+        </enemy>
         <target>
             <x>609</x>
             <y>693</y>
@@ -61,19 +69,31 @@
     </atenelis>
     <misti>
         <drag_locked>true</drag_locked>
+        <enemy>
+            <x>30</x>
+            <y>242</y>
+        </enemy>
         <target>
             <x>609</x>
             <y>693</y>
         </target>
     </misti>
     <waky>
+        <enemy>
+            <x>23</x>
+            <y>133</y>
+        </enemy>
         <target>
-            <x>659</x>
-            <y>669</y>
+            <x>560</x>
+            <y>631</y>
         </target>
     </waky>
     <zorrilla>
         <drag_locked>true</drag_locked>
+        <enemy>
+            <x>30</x>
+            <y>242</y>
+        </enemy>
         <target>
             <x>609</x>
             <y>693</y>
