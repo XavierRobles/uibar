@@ -15,6 +15,7 @@ local combat_categories = {
     [14] = true,  -- readies/starts (parser dependent)
 }
 local expiry_secs = 30
+local cleanup_counter = 0
 
 local function now()
     return os.time()
@@ -99,7 +100,9 @@ function M.handle_action(act)
     }
 
     -- Cheap periodic cleanup.
-    if math.random(1, 100) == 1 then
+    cleanup_counter = cleanup_counter + 1
+    if cleanup_counter >= 100 then
+        cleanup_counter = 0
         cleanup_stale()
     end
 end
@@ -120,17 +123,25 @@ local function extract_first_target_id_from_parsed(p)
     return to_n(p.Target or p.target or p['Target ID'] or p.target_id)
 end
 
-function M.handle_chunk(id, data, packets)
-    if id ~= 0x028 or not data then
+function M.handle_chunk(id, data, packets, parsed_action)
+    if id ~= 0x028 then
         return
     end
 
-    local p = packets and packets.parse and packets.parse('incoming', data) or nil
+    local p = parsed_action
+    if type(p) ~= 'table' and data then
+        p = packets and packets.parse and packets.parse('incoming', data) or nil
+    end
     if type(p) ~= 'table' then
         return
     end
 
-    local actor_id = to_n(p.Actor or p.actor or p.UserId or p.user_id or p.ActorId)
+    local category = to_n(p.category or p.Category or p.type or p.Type)
+    if category > 0 and not combat_categories[category] then
+        return
+    end
+
+    local actor_id = to_n(p.actor_id or p.Actor or p.actor or p.UserId or p.user_id or p.ActorId)
     if actor_id <= 0 then
         return
     end

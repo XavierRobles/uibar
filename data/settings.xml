@@ -80,8 +80,8 @@
     </misti>
     <waky>
         <enemy>
-            <x>23</x>
-            <y>133</y>
+            <x>30</x>
+            <y>242</y>
         </enemy>
         <target>
             <x>560</x>

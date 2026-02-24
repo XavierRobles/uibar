@@ -14,7 +14,6 @@ local util = require('uibarutil')
 local debuffs = require('uibardebuffs')
 local status = require('uibarstatus')
 local actiontracker = require('uibaractiontracker')
-local actionparse = require('uibarpacketparse')
 local mobdb = require('uibarmobdb')
 local renderer = require('uibarrender')
 local panels_mod = require('uibarpanels')
@@ -24,19 +23,22 @@ local settings = config.load(defaults)
 
 local state = {
     last_update = 0,
+    last_expire_sweep = 0,
     mob_debuffs = {},
     mob_debuff_marks = {},
     target_buffs = {},
     mob_debuff_spell = {},
     mob_party_touch = {},
+    last_cc_by_actor = {},
     enemy_target_cache = {},
     enemy_rows_cache = {},
     enemy_rows_next_at = 0,
-    retail_debug = true,
+    retail_debug = false,
     last_drag_save = 0,
     mouse_x = 0,
     mouse_y = 0,
 }
+local actionparse = nil
 
 local panels = panels_mod.create(settings)
 local gstate = graphics.create(settings)
@@ -182,9 +184,11 @@ windower.register_event('zone change', function()
     state.target_buffs = {}
     state.mob_debuff_spell = {}
     state.mob_party_touch = {}
+    state.last_cc_by_actor = {}
     state.enemy_target_cache = {}
     state.enemy_rows_cache = {}
     state.enemy_rows_next_at = 0
+    state.last_expire_sweep = 0
     mobdb.on_zone_change()
     status.clear()
     actiontracker.clear()
@@ -198,11 +202,19 @@ windower.register_event('incoming chunk', function(id, data)
     if not data then
         return
     end
+    local parsed_028 = nil
     if id == 0x028 then
         local p = windower and windower.packets and windower.packets.parse_action and windower.packets.parse_action(data) or nil
-        local a = packets.parse('incoming', data)
-        local b = actionparse.parse_action_packet(data)
+        if not p then
+            p = packets.parse('incoming', data)
+        end
+        parsed_028 = p
         if state.retail_debug then
+            local a = packets.parse('incoming', data)
+            if not actionparse then
+                actionparse = require('uibarpacketparse')
+            end
+            local b = actionparse and actionparse.parse_action_packet and actionparse.parse_action_packet(data) or nil
             local sp = packet_spell_id(p)
             local sa = packet_spell_id(a)
             local sb = packet_spell_id(b)
@@ -218,16 +230,9 @@ windower.register_event('incoming chunk', function(id, data)
         end
         if p then
             debuffs.apply_action(state, p, settings, windower)
-        else
-            if a then
-                debuffs.apply_action(state, a, settings, windower)
-            end
-            if b then
-                debuffs.apply_action(state, b, settings, windower)
-            end
         end
     end
-    actiontracker.handle_chunk(id, data, packets)
+    actiontracker.handle_chunk(id, data, packets, parsed_028)
     status.handlechunk(id, data, packets)
     if id ~= 0x029 then
         return
@@ -307,7 +312,10 @@ windower.register_event('prerender', function()
     -- Throttle heavy logic/text updates.
     if t - state.last_update >= settings.update_interval then
         state.last_update = t
-        debuffs.clear_expired(state)
+        if t - (state.last_expire_sweep or 0) >= 0.75 then
+            debuffs.clear_expired(state)
+            state.last_expire_sweep = t
+        end
         render()
     end
 

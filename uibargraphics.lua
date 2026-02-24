@@ -358,6 +358,107 @@ local function get_target_of_target(target)
     return out
 end
 
+local function build_party_index_map(ffxi)
+    local map = {}
+    local p = ffxi and ffxi.get_party and ffxi.get_party() or nil
+    if type(p) ~= 'table' then
+        return map
+    end
+    for _, m in pairs(p) do
+        if type(m) == 'table' then
+            local midx = tonumber((m.mob and m.mob.index) or m.index or 0) or 0
+            if midx > 0 then
+                map[midx] = {
+                    id = tonumber((m.mob and m.mob.id) or m.id or 0) or 0,
+                    index = midx,
+                    name = m.name,
+                    is_npc = false,
+                }
+            end
+        end
+    end
+    return map
+end
+
+local function resolve_party_member_by_index(ffxi, idx, party_index_map)
+    idx = tonumber(idx or 0) or 0
+    if idx <= 0 then
+        return nil
+    end
+    if type(party_index_map) == 'table' and party_index_map[idx] then
+        return party_index_map[idx]
+    end
+    return build_party_index_map(ffxi)[idx]
+end
+
+local function get_target_of_target_enemy(target, party_index_map)
+    if not target then
+        return nil
+    end
+
+    local ffxi = windower and windower.ffxi or nil
+    local get_by_index = ffxi and ffxi.get_mob_by_index or nil
+    local get_by_id = ffxi and ffxi.get_mob_by_id or nil
+    if type(get_by_index) ~= 'function' then
+        return nil
+    end
+
+    local function to_i(v)
+        return tonumber(v or 0) or 0
+    end
+
+    local function resolve_by_index(idx)
+        if idx <= 0 then
+            return nil
+        end
+        local m = get_by_index(idx)
+        if m and m.name and m.name ~= '' then
+            return m
+        end
+        return resolve_party_member_by_index(ffxi, idx, party_index_map)
+    end
+
+    local tix = to_i(target.target_index or target.targ_index or target['Target Index'] or target.TargetedIndex or target.targeted_index or target['Targeted Index'])
+    if tix > 0 then
+        local m = resolve_by_index(tix)
+        if m then
+            return m
+        end
+    end
+
+    local tid = to_i(target.target_id or target.targ_id or target['Target ID'] or target.TargetedId or target.targeted_id or target['Targeted ID'])
+    if tid > 0 and type(get_by_id) == 'function' then
+        local m = get_by_id(tid)
+        if m and m.name and m.name ~= '' then
+            return m
+        end
+    end
+
+    local traw = to_i(target.target)
+    if traw > 0 then
+        local m = resolve_by_index(traw)
+        if m then
+            return m
+        end
+        if type(get_by_id) == 'function' then
+            local m2 = get_by_id(traw)
+            if m2 and m2.name and m2.name ~= '' then
+                return m2
+            end
+        end
+    end
+
+    local actor_id = to_i(target.id)
+    if target.is_npc and actor_id > 0 and actiontracker and actiontracker.get_last_target_index then
+        local atix = to_i(actiontracker.get_last_target_index(actor_id))
+        if atix > 0 then
+            return resolve_by_index(atix)
+        end
+    end
+
+    return nil
+end
+
 local function make_timer_text()
     local t = texts.new('', {
         pos = {x = 0, y = 0},
@@ -1020,7 +1121,8 @@ local function update_tooltip(state, mouse_x, mouse_y)
 end
 
 local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids, ally_ids, all_ids)
-    local mobs = windower.ffxi.get_mob_array()
+    local ffxi = windower and windower.ffxi or nil
+    local mobs = ffxi and ffxi.get_mob_array and ffxi.get_mob_array() or nil
     if not mobs then
         return {}
     end
@@ -1035,8 +1137,22 @@ local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids,
     local max_visible_sq = 50 * 50
     local no_target_clear_secs = 8
     local party_touch_grace_secs = 45
+    local party_index_map = build_party_index_map(ffxi)
+    local alive = {}
 
     local rows = {}
+    local function has_active_debuff(mid)
+        local dset = logic_state and logic_state.mob_debuffs and logic_state.mob_debuffs[mid] or nil
+        if type(dset) ~= 'table' then
+            return false
+        end
+        for _, expires in pairs(dset) do
+            if tonumber(expires or 0) > now_u then
+                return true
+            end
+        end
+        return false
+    end
 
     for _, mob in pairs(mobs) do
         if mob and mob.is_npc and mob.valid_target and tonumber(mob.hpp or 0) > 0 and mob.distance then
@@ -1049,10 +1165,12 @@ local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids,
                 end
             end
             if within then
-                local tgt = get_target_of_target(mob)
+                alive[mid] = true
+                local tgt = get_target_of_target_enemy(mob, party_index_map)
                 local tid = tonumber(tgt and tgt.id or 0) or 0
                 local touched_at = logic_state.mob_party_touch and tonumber(logic_state.mob_party_touch[mid] or 0) or 0
                 local party_touch_recent = touched_at > 0 and (now_u - touched_at) <= party_touch_grace_secs
+                local debuff_active = has_active_debuff(mid)
 
                 if tid > 0 and all_ids and all_ids[tid] then
                     if mid > 0 then
@@ -1073,7 +1191,7 @@ local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids,
                         party_ids = party_ids,
                         ally_ids = ally_ids,
                     }
-                elseif party_touch_recent then
+                elseif party_touch_recent or debuff_active then
                     local c = cache[mid]
                     rows[#rows + 1] = {
                         mob = mob,
@@ -1133,20 +1251,11 @@ local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids,
     end
 
     -- Cleanup cache entries that no longer have a corresponding visible mob entity.
-    do
-        local alive = {}
-        for _, mob in pairs(mobs) do
-            local mid = tonumber(mob and mob.id or 0) or 0
-            if mid > 0 and mob.is_npc and mob.valid_target and tonumber(mob.hpp or 0) > 0 and mob.distance and mob.distance <= max_visible_sq then
-                alive[mid] = true
-            end
-        end
-        for mid, _ in pairs(cache) do
-            if not alive[mid] then
-                cache[mid] = nil
-                if logic_state.mob_party_touch then
-                    logic_state.mob_party_touch[mid] = nil
-                end
+    for mid, _ in pairs(cache) do
+        if not alive[mid] then
+            cache[mid] = nil
+            if logic_state.mob_party_touch then
+                logic_state.mob_party_touch[mid] = nil
             end
         end
     end
@@ -1172,6 +1281,71 @@ local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids,
     return rows
 end
 
+local function get_cached_sorted_debuff_entries(logic_state, mob_id, now)
+    logic_state.debuff_entries_cache = logic_state.debuff_entries_cache or {}
+    local cache = logic_state.debuff_entries_cache
+    local mid = tonumber(mob_id or 0) or 0
+    if mid <= 0 then
+        return {}
+    end
+
+    local c = cache[mid]
+    if c and now <= (tonumber(c.expires or 0) or 0) and type(c.entries) == 'table' then
+        return c.entries
+    end
+
+    local entries = debuffs.get_active_entries(logic_state, mid) or {}
+    sort_target_debuff_entries(entries)
+    cache[mid] = {
+        expires = now + 0.12,
+        entries = entries,
+    }
+
+    local sweep_at = tonumber(logic_state.debuff_entries_sweep_at or 0) or 0
+    if now >= sweep_at then
+        for k, v in pairs(cache) do
+            if type(v) ~= 'table' or now > ((tonumber(v.expires or 0) or 0) + 5.0) then
+                cache[k] = nil
+            end
+        end
+        logic_state.debuff_entries_sweep_at = now + 5.0
+    end
+
+    return entries
+end
+
+local function get_cached_player_entries(target, logic_state, now, max_items)
+    logic_state.player_buff_cache = logic_state.player_buff_cache or {}
+    local cache = logic_state.player_buff_cache
+    local tid = tonumber(target and target.id or 0) or 0
+    if tid <= 0 then
+        return {}
+    end
+
+    local c = cache[tid]
+    if c and now <= (tonumber(c.expires or 0) or 0) and type(c.entries) == 'table' then
+        return c.entries
+    end
+
+    local entries = player_buff_entries_for_target(target, logic_state, max_items) or {}
+    cache[tid] = {
+        expires = now + 0.20,
+        entries = entries,
+    }
+
+    local sweep_at = tonumber(logic_state.player_buff_sweep_at or 0) or 0
+    if now >= sweep_at then
+        for k, v in pairs(cache) do
+            if type(v) ~= 'table' or now > ((tonumber(v.expires or 0) or 0) + 8.0) then
+                cache[k] = nil
+            end
+        end
+        logic_state.player_buff_sweep_at = now + 8.0
+    end
+
+    return entries
+end
+
 function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
     if not settings.graphics.enabled then
         M.hide(state)
@@ -1180,8 +1354,23 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
 
     local bar_cfg = settings.graphics.bar
     local icon_cfg = settings.graphics.icons
-    local party_ids, ally_ids, all_ids = party.get_claim_sets()
     local now = os.clock()
+    state.claim_cache = state.claim_cache or {
+        next_at = 0,
+        party_ids = {},
+        ally_ids = {},
+        all_ids = {},
+    }
+    if now >= (tonumber(state.claim_cache.next_at or 0) or 0) then
+        local pids, aids, all = party.get_claim_sets()
+        state.claim_cache.party_ids = pids or {}
+        state.claim_cache.ally_ids = aids or {}
+        state.claim_cache.all_ids = all or {}
+        state.claim_cache.next_at = now + 0.20
+    end
+    local party_ids = state.claim_cache.party_ids
+    local ally_ids = state.claim_cache.ally_ids
+    local all_ids = state.claim_cache.all_ids
     local dt = now - (state.anim.last_clock or now)
     state.anim.last_clock = now
     if dt < 0 then
@@ -1324,7 +1513,17 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         state.target_dist:pos(tbar_x + bar_cfg.width - dist_w, tbar_y - 22)
         state.target_dist:show()
 
-        local tot = get_target_of_target(target)
+        state.tot_cache = state.tot_cache or {target_id = 0, value = nil, expires = 0}
+        local target_id_num = tonumber(target.id or 0) or 0
+        local tot = nil
+        if state.tot_cache.target_id == target_id_num and now <= (tonumber(state.tot_cache.expires or 0) or 0) then
+            tot = state.tot_cache.value
+        else
+            tot = get_target_of_target(target)
+            state.tot_cache.target_id = target_id_num
+            state.tot_cache.value = tot
+            state.tot_cache.expires = now + 0.10
+        end
         if tot and tot.name and tot.name ~= '' then
             local tinfo = (tot.is_npc and mobdb and mobdb.get_mob_info) and mobdb.get_mob_info(tot) or nil
             local tr, tg, tb = target_name_color(tot, party_ids, ally_ids, tinfo)
@@ -1349,11 +1548,10 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         local entries
         local show_timers = true
         if is_npc then
-            entries = debuffs.get_active_entries(logic_state, target.id, icon_cfg.max_target_debuffs)
-            sort_target_debuff_entries(entries)
+            entries = get_cached_sorted_debuff_entries(logic_state, target.id, now)
             show_timers = true
         else
-            entries = player_buff_entries_for_target(target, logic_state, icon_cfg.max_target_debuffs)
+            entries = get_cached_player_entries(target, logic_state, now, icon_cfg.max_target_debuffs)
             show_timers = false
         end
         show_icon_grid(
@@ -1389,10 +1587,11 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         state.anim.prev_target_w = nil
         state.anim.damage_flash_timer = 0
         state.anim.heal_flash_timer = 0
+        state.tot_cache = nil
     end
 
     -- Enemy list (graphical): cache expensive mob scan briefly to reduce per-frame load.
-    local enemy_refresh = 0.12
+    local enemy_refresh = 0.25
     logic_state.enemy_rows_cache = logic_state.enemy_rows_cache or {}
     if now >= (logic_state.enemy_rows_next_at or 0) then
         logic_state.enemy_rows_cache = collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids, ally_ids, all_ids)
@@ -1444,8 +1643,7 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
             row.tot:hide()
         end
 
-        local dents = debuffs.get_active_entries(logic_state, e.mob.id, settings.enemy.max_debuffs_per_enemy or 4)
-        sort_target_debuff_entries(dents)
+        local dents = get_cached_sorted_debuff_entries(logic_state, e.mob.id, now)
         local max_icons = math.min(#dents, settings.enemy.max_debuffs_per_enemy or 4)
         ensure_pool(row.icons, max_icons)
         ensure_text_pool(row.itimes, max_icons)
