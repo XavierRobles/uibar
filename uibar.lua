@@ -1,6 +1,6 @@
 _addon.name = 'uibar'
 _addon.author = 'Xavie'
-_addon.version = '0.2.1'
+_addon.version = '0.2.2'
 _addon.commands = {'uibar', 'ub'}
 
 require('strings')
@@ -18,6 +18,7 @@ local mobdb = require('uibarmobdb')
 local renderer = require('uibarrender')
 local panels_mod = require('uibarpanels')
 local graphics = require('uibargraphics')
+local party = require('uibarparty')
 
 local settings = config.load(defaults)
 
@@ -174,6 +175,9 @@ windower.register_event('load', function()
     mobdb.on_zone_change()
     status.clear()
     actiontracker.clear()
+    if party.invalidate_cache then
+        party.invalidate_cache()
+    end
     update_drag_ui()
     render()
 end)
@@ -192,6 +196,9 @@ windower.register_event('zone change', function()
     mobdb.on_zone_change()
     status.clear()
     actiontracker.clear()
+    if party.invalidate_cache then
+        party.invalidate_cache()
+    end
 end)
 
 windower.register_event('action', function(act)
@@ -316,7 +323,9 @@ windower.register_event('prerender', function()
             debuffs.clear_expired(state)
             state.last_expire_sweep = t
         end
-        render()
+        if not settings.graphics.enabled then
+            render()
+        end
     end
 
 end)

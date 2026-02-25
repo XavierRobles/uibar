@@ -23,6 +23,18 @@ local debuff_priority = {
     [3] = 10,  -- poison
 }
 
+local TARGET_NAME_COLORS = {
+    PARTY = {170, 240, 255},
+    ALLIANCE = {135, 185, 255},
+    WHITE = {255, 255, 255},
+    GREEN = {64, 255, 128},
+    YELLOW = {240, 232, 160},
+    RED = {255, 64, 64},
+    PURPLE = {190, 100, 220},
+    PINK = {255, 160, 200},
+    CFH = {233, 174, 102},
+}
+
 local function health_color(pct)
     if pct >= 75 then
         return 90, 220, 120
@@ -543,56 +555,87 @@ local function is_call_for_help(target)
     return false
 end
 
-local function target_name_color(target, party_ids, ally_ids, mob_info)
-    local C = {
-        PARTY = {170, 240, 255},
-        ALLIANCE = {135, 185, 255},
-        WHITE = {255, 255, 255},
-        GREEN = {64, 255, 128},
-        YELLOW = {240, 232, 160},
-        RED = {255, 64, 64},
-        PURPLE = {190, 100, 220},
-        PINK = {255, 160, 200},
-        CFH = {233, 174, 102},
-    }
+local function entity_spawn_type(entity)
+    return tonumber(entity and entity.spawn_type or 0) or 0
+end
 
+local function is_mob_entity(entity)
+    if not entity then
+        return false
+    end
+    if entity.is_mob == true then
+        return true
+    end
+    return entity_spawn_type(entity) == 16
+end
+
+local function is_trust_entity(entity)
+    return entity_spawn_type(entity) == 14
+end
+
+local NON_HOSTILE_NPC_SPAWNS = {
+    [2] = true,   -- npc
+    [13] = true,  -- object/event
+    [14] = true,  -- trust
+    [15] = true,  -- event object
+    [34] = true,  -- npc/object variant
+}
+
+local function is_non_hostile_npc_entity(entity)
+    if not entity then
+        return false
+    end
+    if is_mob_entity(entity) then
+        return false
+    end
+    local st = entity_spawn_type(entity)
+    if NON_HOSTILE_NPC_SPAWNS[st] then
+        return true
+    end
+    return entity.is_npc == true and entity.is_mob ~= true
+end
+
+local function target_name_color(target, party_ids, ally_ids)
     local function rgb(arr)
         return arr[1], arr[2], arr[3]
     end
 
-    if target and not target.is_npc then
-        local tid = tonumber(target.id or 0) or 0
+    local tid = tonumber(target and target.id or 0) or 0
+    if tid > 0 then
         if party_ids and party_ids[tid] then
-            return rgb(C.PARTY)
+            return rgb(TARGET_NAME_COLORS.PARTY)
         end
         if ally_ids and ally_ids[tid] then
-            return rgb(C.ALLIANCE)
+            return rgb(TARGET_NAME_COLORS.ALLIANCE)
         end
-        return rgb(C.WHITE)
     end
 
-    -- Non-hostile NPC / objects (not tracked in mobdb tables).
-    if (target and target.is_npc) and (mob_info == nil) then
-        return rgb(C.GREEN)
+    if target and not target.is_npc then
+        return rgb(TARGET_NAME_COLORS.WHITE)
+    end
+
+    -- Non-hostile NPC / objects (includes trusts).
+    if is_non_hostile_npc_entity(target) then
+        return rgb(TARGET_NAME_COLORS.GREEN)
     end
 
     -- Mob claim colors.
     local cfh = is_call_for_help(target)
     if cfh then
-        return rgb(C.CFH)
+        return rgb(TARGET_NAME_COLORS.CFH)
     end
 
     local claim_id = tonumber(target and target.claim_id or 0) or 0
     if claim_id == 0 then
-        return rgb(C.YELLOW)
+        return rgb(TARGET_NAME_COLORS.YELLOW)
     end
     if party_ids and party_ids[claim_id] then
-        return rgb(C.RED)
+        return rgb(TARGET_NAME_COLORS.RED)
     end
     if ally_ids and ally_ids[claim_id] then
-        return rgb(C.PURPLE)
+        return rgb(TARGET_NAME_COLORS.PURPLE)
     end
-    return rgb(C.PINK)
+    return rgb(TARGET_NAME_COLORS.PINK)
 end
 
 local function draw_trails(bar, x, y, h, dt, state)
@@ -862,6 +905,9 @@ function M.create(settings)
 end
 
 function M.hide(state)
+    if state._is_hidden then
+        return
+    end
     hide_bar(state.target_hp)
     state.target_name:hide()
     state.target_tot:hide()
@@ -874,6 +920,7 @@ function M.hide(state)
     hide_text_pool(state.target_debuff_marks)
     hide_pool(state.target_detect_icons)
     hide_enemy_rows(state)
+    state._is_hidden = true
 end
 
 function M.destroy(state)
@@ -1141,21 +1188,36 @@ local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids,
     local alive = {}
 
     local rows = {}
+    local function should_skip_enemy_entity(mob, all_ids_set)
+        local mid = tonumber(mob and mob.id or 0) or 0
+        if mid <= 0 then
+            return true
+        end
+        if all_ids_set and all_ids_set[mid] then
+            return true
+        end
+        if mob and (mob.in_party == true or mob.in_alliance == true) then
+            return true
+        end
+        if is_trust_entity(mob) then
+            return true
+        end
+        if not is_mob_entity(mob) then
+            return true
+        end
+        return false
+    end
+
     local function has_active_debuff(mid)
         local dset = logic_state and logic_state.mob_debuffs and logic_state.mob_debuffs[mid] or nil
         if type(dset) ~= 'table' then
             return false
         end
-        for _, expires in pairs(dset) do
-            if tonumber(expires or 0) > now_u then
-                return true
-            end
-        end
-        return false
+        return next(dset) ~= nil
     end
 
     for _, mob in pairs(mobs) do
-        if mob and mob.is_npc and mob.valid_target and tonumber(mob.hpp or 0) > 0 and mob.distance then
+        if mob and mob.valid_target and tonumber(mob.hpp or 0) > 0 and mob.distance and (not should_skip_enemy_entity(mob, all_ids)) then
             local mid = tonumber(mob.id or 0) or 0
             local within = mob.distance <= max_visible_sq
             if not within and mid > 0 then
@@ -1181,10 +1243,8 @@ local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids,
                             last_target_at = now_ts,
                         }
                     end
-                    local info = mobdb and mobdb.get_mob_info and mobdb.get_mob_info(mob) or nil
                     rows[#rows + 1] = {
                         mob = mob,
-                        info = info,
                         target = tgt,
                         distance = math.sqrt(math.max(0, mob.distance or 0)),
                         hpp = tonumber(mob.hpp or 0) or 0,
@@ -1195,7 +1255,6 @@ local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids,
                     local c = cache[mid]
                     rows[#rows + 1] = {
                         mob = mob,
-                        info = mobdb and mobdb.get_mob_info and mobdb.get_mob_info(mob) or nil,
                         target = c and {
                             id = tonumber(c.id or 0) or 0,
                             name = c.name or '',
@@ -1220,10 +1279,8 @@ local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids,
                         else
                             c.seen_at = now_ts
                             cache[mid] = c
-                            local info = mobdb and mobdb.get_mob_info and mobdb.get_mob_info(mob) or nil
                             rows[#rows + 1] = {
                                 mob = mob,
-                                info = info,
                                 target = {
                                     id = tonumber(c.id or 0) or 0,
                                     name = c.name or '',
@@ -1240,7 +1297,7 @@ local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids,
                     end
                 end
             end
-        elseif mob and mob.is_npc and tonumber(mob.id or 0) and tonumber(mob.id or 0) > 0 then
+        elseif mob and tonumber(mob.id or 0) and tonumber(mob.id or 0) > 0 then
             -- Dead or invalid mobs should be removed from cache.
             local dead_id = tonumber(mob.id)
             cache[dead_id] = nil
@@ -1351,6 +1408,7 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         M.hide(state)
         return
     end
+    state._is_hidden = false
 
     local bar_cfg = settings.graphics.bar
     local icon_cfg = settings.graphics.icons
@@ -1427,7 +1485,7 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         end
         local is_npc = target.is_npc and true or false
         local info = (is_npc and mobdb and mobdb.get_mob_info) and mobdb.get_mob_info(target) or nil
-        local nr, ng, nb = target_name_color(target, party_ids, ally_ids, info)
+        local nr, ng, nb = target_name_color(target, party_ids, ally_ids)
         local lvl = (is_npc and mobdb and mobdb.level_string) and mobdb.level_string(info) or nil
         local job = (is_npc and mobdb and mobdb.job_string) and mobdb.job_string(info) or nil
         local name
@@ -1515,8 +1573,16 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
 
         state.tot_cache = state.tot_cache or {target_id = 0, value = nil, expires = 0}
         local target_id_num = tonumber(target.id or 0) or 0
+        local me = windower.ffxi.get_player()
+        local my_id = tonumber(me and me.id or 0) or 0
         local tot = nil
-        if state.tot_cache.target_id == target_id_num and now <= (tonumber(state.tot_cache.expires or 0) or 0) then
+        if my_id > 0 and target_id_num == my_id then
+            -- XIUI-style behavior: self-target always points to self.
+            tot = target
+            state.tot_cache.target_id = target_id_num
+            state.tot_cache.value = tot
+            state.tot_cache.expires = now + 0.10
+        elseif state.tot_cache.target_id == target_id_num and now <= (tonumber(state.tot_cache.expires or 0) or 0) then
             tot = state.tot_cache.value
         else
             tot = get_target_of_target(target)
@@ -1525,13 +1591,15 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
             state.tot_cache.expires = now + 0.10
         end
         if tot and tot.name and tot.name ~= '' then
-            local tinfo = (tot.is_npc and mobdb and mobdb.get_mob_info) and mobdb.get_mob_info(tot) or nil
-            local tr, tg, tb = target_name_color(tot, party_ids, ally_ids, tinfo)
+            local tr, tg, tb = target_name_color(tot, party_ids, ally_ids)
             pcall(function()
                 state.target_tot:color(tr, tg, tb)
             end)
             state.target_tot:text('-> ' .. short_name(tot.name, 20))
-            state.target_tot:pos(tbar_x + bar_cfg.width + 10, tbar_y - 22)
+            local _, tot_h = state.target_tot:extents()
+            tot_h = tot_h or 10
+            local tot_y = tbar_y + math.floor(((bar_cfg.height + 2) - tot_h) * 0.5) - 1
+            state.target_tot:pos(tbar_x + bar_cfg.width + 10, tot_y)
             state.target_tot:show()
         else
             state.target_tot:hide()
@@ -1591,7 +1659,7 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
     end
 
     -- Enemy list (graphical): cache expensive mob scan briefly to reduce per-frame load.
-    local enemy_refresh = 0.25
+    local enemy_refresh = 0.30
     logic_state.enemy_rows_cache = logic_state.enemy_rows_cache or {}
     if now >= (logic_state.enemy_rows_next_at or 0) then
         logic_state.enemy_rows_cache = collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids, ally_ids, all_ids)
@@ -1622,7 +1690,7 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         local mr, mg, mb = health_color(e.hpp)
         set_bar(row.hp, ex, y + 9, ew, eh, e.hpp, 100, mr, mg, mb)
 
-        local nr, ng, nb = target_name_color(e.mob, e.party_ids, e.ally_ids, e.info)
+        local nr, ng, nb = target_name_color(e.mob, e.party_ids, e.ally_ids)
         row.name:text(short_name(e.mob.name or 'Mob', 30))
         pcall(function() row.name:color(nr, ng, nb) end)
         row.name:pos(ex, y - 8)
@@ -1634,10 +1702,13 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         row.info:show()
 
         if e.target and e.target.name and e.target.name ~= '' then
-            local tr, tg, tb = target_name_color(e.target, e.party_ids, e.ally_ids, nil)
+            local tr, tg, tb = target_name_color(e.target, e.party_ids, e.ally_ids)
             row.tot:text('-> ' .. short_name(e.target.name, 14))
             pcall(function() row.tot:color(tr, tg, tb) end)
-            row.tot:pos(ex + ew + 8, y - 8)
+            local _, row_tot_h = row.tot:extents()
+            row_tot_h = row_tot_h or 8
+            local row_tot_y = (y + 9) + math.floor((eh - row_tot_h) * 0.5) - 1
+            row.tot:pos(ex + ew + 8, row_tot_y)
             row.tot:show()
         else
             row.tot:hide()

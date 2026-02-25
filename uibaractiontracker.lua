@@ -16,6 +16,10 @@ local combat_categories = {
 }
 local expiry_secs = 30
 local cleanup_counter = 0
+local entity_type_cache = {}
+local index_cache = {}
+local entity_cache_ttl = 5
+local index_cache_ttl = 1
 
 local function now()
     return os.time()
@@ -42,23 +46,40 @@ local function get_mob_by_id(id)
 end
 
 local function get_index_from_id(id)
+    local t = now()
+    local c = index_cache[id]
+    if type(c) == 'table' and to_n(c.expires) >= t then
+        return to_n(c.index)
+    end
     local m = get_mob_by_id(id)
-    return to_n(m and m.index)
+    local idx = to_n(m and m.index)
+    index_cache[id] = {
+        index = idx,
+        expires = t + index_cache_ttl,
+    }
+    return idx
 end
 
 local function is_non_player_entity(id)
+    local t = now()
+    local c = entity_type_cache[id]
+    if type(c) == 'table' and to_n(c.expires) >= t then
+        return c.value == true
+    end
     local m = get_mob_by_id(id)
     if not m then
+        entity_type_cache[id] = {value = false, expires = t + 1}
         return false
     end
-    if m.is_npc then
-        return true
-    end
-    return false
+    local is_non_player = (m.is_npc == true) or ((to_n(m.spawn_type) == 16) and (m.is_mob ~= false))
+    entity_type_cache[id] = {value = is_non_player, expires = t + entity_cache_ttl}
+    return is_non_player
 end
 
 function M.clear()
     last_targets = {}
+    entity_type_cache = {}
+    index_cache = {}
 end
 
 function M.handle_action(act)

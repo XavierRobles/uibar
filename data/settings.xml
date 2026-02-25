@@ -67,6 +67,16 @@
             <y>693</y>
         </target>
     </atenelis>
+    <jenifer>
+        <enemy>
+            <x>29</x>
+            <y>166</y>
+        </enemy>
+        <target>
+            <x>651</x>
+            <y>655</y>
+        </target>
+    </jenifer>
     <misti>
         <drag_locked>true</drag_locked>
         <enemy>
@@ -80,8 +90,8 @@
     </misti>
     <waky>
         <enemy>
-            <x>30</x>
-            <y>242</y>
+            <x>197</x>
+            <y>593</y>
         </enemy>
         <target>
             <x>560</x>
