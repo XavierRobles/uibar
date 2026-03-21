@@ -45,6 +45,16 @@
         </target>
         <update_interval>0.15</update_interval>
     </global>
+    <arktema>
+        <enemy>
+            <x>197</x>
+            <y>593</y>
+        </enemy>
+        <target>
+            <x>561</x>
+            <y>745</y>
+        </target>
+    </arktema>
     <arkys>
         <drag_locked>true</drag_locked>
         <enemy>
@@ -69,14 +79,24 @@
     </atenelis>
     <jenifer>
         <enemy>
-            <x>29</x>
-            <y>166</y>
+            <x>177</x>
+            <y>539</y>
         </enemy>
         <target>
             <x>651</x>
             <y>655</y>
         </target>
     </jenifer>
+    <miau>
+        <enemy>
+            <x>197</x>
+            <y>593</y>
+        </enemy>
+        <target>
+            <x>593</x>
+            <y>650</y>
+        </target>
+    </miau>
     <misti>
         <drag_locked>true</drag_locked>
         <enemy>
@@ -88,16 +108,66 @@
             <y>693</y>
         </target>
     </misti>
-    <waky>
+    <todoacien>
+        <enemy>
+            <x>29</x>
+            <y>166</y>
+        </enemy>
+        <target>
+            <x>624</x>
+            <y>699</y>
+        </target>
+    </todoacien>
+    <ventas>
         <enemy>
             <x>197</x>
             <y>593</y>
         </enemy>
         <target>
-            <x>560</x>
-            <y>631</y>
+            <x>622</x>
+            <y>661</y>
+        </target>
+    </ventas>
+    <waky>
+        <enemy>
+            <x>226</x>
+            <y>592</y>
+        </enemy>
+        <target>
+            <x>671</x>
+            <y>699</y>
         </target>
     </waky>
+    <wik>
+        <enemy>
+            <x>304</x>
+            <y>567</y>
+        </enemy>
+        <target>
+            <x>642</x>
+            <y>690</y>
+        </target>
+    </wik>
+    <wike>
+        <enemy>
+            <x>197</x>
+            <y>593</y>
+        </enemy>
+        <target>
+            <x>575</x>
+            <y>657</y>
+        </target>
+    </wike>
+    <yinx>
+        <enemy>
+            <x>29</x>
+            <y>166</y>
+        </enemy>
+        <target>
+            <x>660</x>
+            <y>706</y>
+        </target>
+    </yinx>
     <zorrilla>
         <drag_locked>true</drag_locked>
         <enemy>

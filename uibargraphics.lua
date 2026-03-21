@@ -10,6 +10,7 @@ local util = require('uibarutil')
 local M = {}
 
 local debuff_priority = {
+    [173] = 0, -- dread spikes (enemy hazard)
     [2] = 1,   -- sleep
     [19] = 1,  -- sleep ii
     [10] = 2,  -- stun
@@ -1213,7 +1214,13 @@ local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids,
         if type(dset) ~= 'table' then
             return false
         end
-        return next(dset) ~= nil
+        local now_u = util.unix_now()
+        for buff_id, expires in pairs(dset) do
+            if tonumber(expires or 0) > now_u and debuffs.is_negative_player_status and debuffs.is_negative_player_status(buff_id) then
+                return true
+            end
+        end
+        return false
     end
 
     for _, mob in pairs(mobs) do
@@ -1230,6 +1237,8 @@ local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids,
                 alive[mid] = true
                 local tgt = get_target_of_target_enemy(mob, party_index_map)
                 local tid = tonumber(tgt and tgt.id or 0) or 0
+                local claim_id = tonumber(mob.claim_id or 0) or 0
+                local claim_is_ours = claim_id > 0 and ((party_ids and party_ids[claim_id]) or (ally_ids and ally_ids[claim_id])) or false
                 local touched_at = logic_state.mob_party_touch and tonumber(logic_state.mob_party_touch[mid] or 0) or 0
                 local party_touch_recent = touched_at > 0 and (now_u - touched_at) <= party_touch_grace_secs
                 local debuff_active = has_active_debuff(mid)
@@ -1251,7 +1260,10 @@ local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids,
                         party_ids = party_ids,
                         ally_ids = ally_ids,
                     }
-                elseif party_touch_recent or debuff_active then
+                elseif tid > 0 and mid > 0 then
+                    -- Mob currently targets someone outside party/alliance: treat as not ours.
+                    cache[mid] = nil
+                elseif party_touch_recent or (debuff_active and (claim_id == 0 or claim_is_ours)) then
                     local c = cache[mid]
                     rows[#rows + 1] = {
                         mob = mob,
@@ -1265,14 +1277,10 @@ local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids,
                         party_ids = party_ids,
                         ally_ids = ally_ids,
                     }
-                elseif tid > 0 and mid > 0 then
-                    -- Mob currently targets someone outside party/alliance: treat as hate lost.
-                    cache[mid] = nil
                 elseif mid > 0 then
                     local c = cache[mid]
                     if c and all_ids and all_ids[tonumber(c.id or 0) or 0] then
                         -- If mob has no visible target and no claim for a while, consider hate lost.
-                        local claim_id = tonumber(mob.claim_id or 0) or 0
                         local last_target_at = tonumber(c.last_target_at or c.seen_at or now_ts) or now_ts
                         if claim_id == 0 and (now_ts - last_target_at) > no_target_clear_secs then
                             cache[mid] = nil
@@ -1673,6 +1681,7 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
     local icon_size = math.max(12, math.floor((icon_cfg.size or 22) * 0.62))
     local row_gap = eh + icon_size + 31
     local icon_gap = 1
+    local selected_enemy_id = tonumber(target and target.id or 0) or 0
 
     state.enemy_title:hide()
     if state.enemy_drag then
@@ -1686,17 +1695,41 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         local e = erows[i]
         local row = ensure_enemy_row(state, i)
         local y = ey + (i - 1) * row_gap
+        local mob_id = tonumber(e.mob and e.mob.id or 0) or 0
+        local is_selected = (selected_enemy_id > 0 and mob_id == selected_enemy_id)
 
         local mr, mg, mb = health_color(e.hpp)
         set_bar(row.hp, ex, y + 9, ew, eh, e.hpp, 100, mr, mg, mb)
+        if is_selected then
+            row.hp.border:color(255, 222, 120)
+            row.hp.border:alpha(255)
+            row.hp.bg:color(52, 56, 70)
+            row.hp.bg:alpha(250)
+        else
+            row.hp.border:color(8, 12, 18)
+            row.hp.border:alpha(230)
+            row.hp.bg:color(35, 38, 45)
+            row.hp.bg:alpha(240)
+        end
 
         local nr, ng, nb = target_name_color(e.mob, e.party_ids, e.ally_ids)
-        row.name:text(short_name(e.mob.name or 'Mob', 30))
-        pcall(function() row.name:color(nr, ng, nb) end)
+        local row_name = short_name(e.mob.name or 'Mob', 30)
+        if is_selected then
+            row_name = '> ' .. row_name
+            pcall(function() row.name:color(math.min(255, nr + 35), math.min(255, ng + 35), math.min(255, nb + 35)) end)
+        else
+            pcall(function() row.name:color(nr, ng, nb) end)
+        end
+        row.name:text(row_name)
         row.name:pos(ex, y - 8)
         row.name:show()
 
         row.info:text(string.format('%d%%  %.1f', e.hpp, e.distance))
+        if is_selected then
+            pcall(function() row.info:color(255, 232, 150) end)
+        else
+            pcall(function() row.info:color(215, 215, 215) end)
+        end
         local iw = row.info:extents() or 64
         row.info:pos(ex + ew - iw, y - 8)
         row.info:show()

@@ -17,7 +17,7 @@ local spell_damage_messages = S{2, 252, 264, 265}
 local known_debuff_duration = {
     [2] = 60, [3] = 120, [4] = 120, [5] = 180, [6] = 120, [10] = 5, [11] = 60, [12] = 120, [13] = 180,
     [19] = 90, [128] = 180, [129] = 180, [130] = 180, [131] = 180, [132] = 180, [133] = 180,
-    [134] = 150, [135] = 150, [147] = 180, [148] = 180, [149] = 180, [167] = 120, [186] = 90, [193] = 30, [194] = 216, [404] = 120
+    [134] = 150, [135] = 150, [147] = 180, [148] = 180, [149] = 180, [167] = 120, [173] = 45, [186] = 90, [193] = 30, [194] = 216, [404] = 120
 }
 
 -- Prioritize duration by spell id (closer to XIUI behavior than buff-only fallback).
@@ -144,6 +144,11 @@ function M.is_positive_player_status(buff_id)
     return (tonumber(buff_id) or 0) > 0 and not negative_player_status:contains(buff_id)
 end
 
+function M.is_trackable_enemy_status(buff_id)
+    local id = tonumber(buff_id or 0) or 0
+    return id > 0 and id <= 1024 and res.buffs[id] ~= nil
+end
+
 local function get_all_ids_cached()
     local now_u = util.unix_now()
     if type(claim_cache.all_ids) == 'table' and (now_u - (tonumber(claim_cache.at or 0) or 0)) <= claim_cache_ttl then
@@ -216,10 +221,29 @@ local function infer_family_buff(spell_id)
     return nil
 end
 
+local function monster_ability_status(ability_id)
+    local id = tonumber(ability_id or 0) or 0
+    if id <= 0 then
+        return nil
+    end
+    local ability = res.monster_abilities and res.monster_abilities[id] or nil
+    local status_id = tonumber(ability and ability.status or 0) or 0
+    if status_id > 0 and status_id <= 1024 and res.buffs[status_id] then
+        return status_id
+    end
+    return nil
+end
+
 local function resolve_buff_id(act, action)
-    local action_type = act.category or act.type or act.Type
-    local spell_id = act.param or act.Param
-    if spell_id and aoe_cc_spells[spell_id] and spell_to_buff[spell_id] then
+    local action_type = tonumber(act.category or act.type or act.Type or 0) or 0
+    local spell_id = tonumber(act.param or act.Param or 0) or 0
+    if spell_id > 0 and (action_type == 11 or action_type == 7) then
+        local status_id = monster_ability_status(spell_id)
+        if status_id then
+            return status_id
+        end
+    end
+    if spell_id > 0 and aoe_cc_spells[spell_id] and spell_to_buff[spell_id] then
         return spell_to_buff[spell_id]
     end
     local buff_id = action.param or action.Param
@@ -228,11 +252,11 @@ local function resolve_buff_id(act, action)
         return buff_id
     end
 
-    if action_type == 4 and spell_id and spell_to_buff[spell_id] then
+    if action_type == 4 and spell_id > 0 and spell_to_buff[spell_id] then
         return spell_to_buff[spell_id]
     end
 
-    if spell_id and spell_to_buff[spell_id] then
+    if spell_id > 0 and spell_to_buff[spell_id] then
         return spell_to_buff[spell_id]
     end
 
@@ -594,13 +618,15 @@ function M.apply_action(state, act, settings, windower_ref)
                     end
                     if buff_id then
                         act_fallback_buff = act_fallback_buff or buff_id
-                        if M.is_negative_player_status(buff_id) and target_is_npc then
-                            apply_debuff(state, tid, buff_id, duration, clear, applied_spell_id)
-                        end
-                        if actor_is_party and target_is_npc and M.is_negative_player_status(buff_id) then
-                            mark_party_touch(state, tid)
-                        end
-                        if M.is_positive_player_status(buff_id) then
+                        local track_on_npc = M.is_trackable_enemy_status(buff_id)
+                        if target_is_npc then
+                            if track_on_npc then
+                                apply_debuff(state, tid, buff_id, duration, clear, applied_spell_id)
+                                if actor_is_party and M.is_negative_player_status(buff_id) then
+                                    mark_party_touch(state, tid)
+                                end
+                            end
+                        elseif M.is_positive_player_status(buff_id) then
                             set_target_buff(state, tid, buff_id)
                         end
                     end
@@ -662,6 +688,12 @@ function M.apply_basic_message(state, basic, windower_ref)
     if status_on_messages:contains(message_id) and buff_id > 0 and aoe_cc_spells[buff_id] and spell_to_buff[buff_id] then
         buff_id = spell_to_buff[buff_id]
     end
+    if status_on_messages:contains(message_id) and buff_id > 0 and not res.buffs[buff_id] then
+        local status_id = monster_ability_status(buff_id)
+        if status_id then
+            buff_id = status_id
+        end
+    end
     if not target_id or not message_id then
         return
     end
@@ -710,10 +742,13 @@ function M.apply_basic_message(state, basic, windower_ref)
                 local me = windower_ref and windower_ref.ffxi and windower_ref.ffxi.get_player and windower_ref.ffxi.get_player() or nil
                 local myid = tonumber(me and me.id or 0) or 0
                 local actor_ok = (aid == 0) or ((aid > 0 and all_ids and all_ids[aid]) or (aid > 0 and aid == myid))
-                if actor_ok and M.is_negative_player_status(b) then
+                local track_on_npc = M.is_trackable_enemy_status(b)
+                if track_on_npc then
                     local used_spell = inferred_spell_id
                     apply_debuff(state, target_id, b, resolve_duration(b, used_spell), nil, used_spell)
-                    mark_party_touch(state, target_id)
+                    if actor_ok and M.is_negative_player_status(b) then
+                        mark_party_touch(state, target_id)
+                    end
                 end
             end
         end
