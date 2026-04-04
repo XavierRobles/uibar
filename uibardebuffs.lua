@@ -39,6 +39,8 @@ local spell_duration = {
     -- Helix
     [278] = 90, [279] = 90, [280] = 90, [281] = 90, [282] = 90, [283] = 90, [284] = 90, [285] = 90,
     [885] = 90, [886] = 90, [887] = 90, [888] = 90, [889] = 90, [890] = 90, [891] = 90, [892] = 90,
+    -- BLU
+    [722] = 60, [727] = 300, [728] = 180, -- Entomb / Silent Storm / Tenebral Crush
 }
 
 local bard_spell_duration = {
@@ -62,6 +64,7 @@ local spell_to_buff = {
     [454] = 217, [455] = 217, [456] = 217, [457] = 217, [458] = 217, [459] = 217, [460] = 217, [461] = 217,
     [278] = 186, [279] = 186, [280] = 186, [281] = 186, [282] = 186, [283] = 186, [284] = 186, [285] = 186,
     [885] = 186, [886] = 186, [887] = 186, [888] = 186, [889] = 186, [890] = 186, [891] = 186, [892] = 186,
+    [722] = 7, [727] = 6, [728] = 149, -- Entomb / Silent Storm / Tenebral Crush
 }
 
 local spell_effects = {
@@ -90,6 +93,9 @@ local spell_effects = {
     [890] = {buff = 186, duration = 90, on_damage = true},
     [891] = {buff = 186, duration = 90, on_damage = true},
     [892] = {buff = 186, duration = 90, on_damage = true},
+    [722] = {buff = 7, on_damage = true},                                  -- Entomb
+    [727] = {buff = 6, duration = 300, on_damage = true},                  -- Silent Storm
+    [728] = {buff = 149, on_damage = true},                                -- Tenebral Crush
 }
 
 -- AoE crowd-control spells that can arrive with incomplete per-target status messages
@@ -218,6 +224,42 @@ local function infer_family_buff(spell_id)
     if n:find('Bio', 1, true) == 1 then
         return 135
     end
+    if n == 'Entomb' then
+        return 7
+    end
+    if n == 'Tenebral Crush' then
+        return 149
+    end
+    return nil
+end
+
+local function infer_named_effect(spell_id)
+    local n = spell_name(spell_id)
+    if n == '' then
+        return nil
+    end
+    if n == 'Entomb' then
+        return {buff = 7, on_damage = true}
+    end
+    if n == 'Silent Storm' then
+        return {buff = 6, duration = 300, on_damage = true}
+    end
+    if n == 'Tenebral Crush' then
+        return {buff = 149, on_damage = true}
+    end
+    return nil
+end
+
+local function infer_spell_status_buff(spell_id)
+    local sid = tonumber(spell_id or 0) or 0
+    if sid <= 0 then
+        return nil
+    end
+    local s = res.spells and res.spells[sid] or nil
+    local buff_id = tonumber(s and s.status or 0) or 0
+    if buff_id > 0 and buff_id <= 1024 and res.buffs[buff_id] then
+        return buff_id
+    end
     return nil
 end
 
@@ -236,6 +278,7 @@ end
 
 local function resolve_buff_id(act, action)
     local action_type = tonumber(act.category or act.type or act.Type or 0) or 0
+    local spell_like = (action_type == 0 or action_type == 4 or action_type == 8)
     local spell_id = tonumber(act.param or act.Param or 0) or 0
     if spell_id > 0 and (action_type == 11 or action_type == 7) then
         local status_id = monster_ability_status(spell_id)
@@ -243,7 +286,7 @@ local function resolve_buff_id(act, action)
             return status_id
         end
     end
-    if spell_id > 0 and aoe_cc_spells[spell_id] and spell_to_buff[spell_id] then
+    if spell_like and spell_id > 0 and aoe_cc_spells[spell_id] and spell_to_buff[spell_id] then
         return spell_to_buff[spell_id]
     end
     local buff_id = action.param or action.Param
@@ -256,13 +299,22 @@ local function resolve_buff_id(act, action)
         return spell_to_buff[spell_id]
     end
 
-    if spell_id > 0 and spell_to_buff[spell_id] then
+    if spell_like and spell_id > 0 and spell_to_buff[spell_id] then
         return spell_to_buff[spell_id]
     end
 
-    local inferred = infer_family_buff(spell_id)
-    if inferred then
-        return inferred
+    if spell_like then
+        local inferred_status = infer_spell_status_buff(spell_id)
+        if inferred_status then
+            return inferred_status
+        end
+    end
+
+    if spell_like then
+        local inferred = infer_family_buff(spell_id)
+        if inferred then
+            return inferred
+        end
     end
 
     return nil
@@ -477,14 +529,21 @@ function M.apply_action(state, act, settings, windower_ref)
         return
     end
 
+    local action_type = tonumber(act.category or act.type or act.Type or 0) or 0
     local spell_id = act.param or act.Param
-    local effect = spell_id and spell_effects[spell_id] or nil
-    if not effect and spell_id then
-        local fam = infer_family_buff(spell_id)
-        if fam == 134 then
-            effect = {buff = 134, duration = 60, clear = 135, on_damage = true}
-        elseif fam == 135 then
-            effect = {buff = 135, duration = 60, clear = 134, on_damage = true}
+    local effect = nil
+    if action_type == 4 and spell_id then
+        effect = spell_effects[spell_id] or nil
+        if not effect then
+            effect = infer_named_effect(spell_id)
+        end
+        if not effect then
+            local fam = infer_family_buff(spell_id)
+            if fam == 134 then
+                effect = {buff = 134, duration = 60, clear = 135, on_damage = true}
+            elseif fam == 135 then
+                effect = {buff = 135, duration = 60, clear = 134, on_damage = true}
+            end
         end
     end
     local actor_id = tonumber(act.actor_id or act.actor or act.Actor or act.UserId or act.user_id or 0) or 0
@@ -493,7 +552,7 @@ function M.apply_action(state, act, settings, windower_ref)
     local myid = tonumber(me and me.id or 0) or 0
     local actor_is_party = (actor_id > 0 and all_ids and all_ids[actor_id]) or (actor_id > 0 and actor_id == myid) or false
 
-    if actor_is_party and spell_id and aoe_cc_spells[spell_id] then
+    if actor_is_party and action_type == 4 and spell_id and aoe_cc_spells[spell_id] then
         state.last_cc_by_actor = state.last_cc_by_actor or {}
         state.last_cc_by_actor[actor_id] = {
             spell_id = tonumber(spell_id or 0) or 0,
@@ -512,7 +571,7 @@ function M.apply_action(state, act, settings, windower_ref)
                 -- Record engagement early even when this packet does not include per-target actions.
                 mark_party_touch(state, tid)
                 -- AoE fallback only when parser provides no per-target action details.
-                if spell_id and aoe_cc_spells[spell_id] and (not has_actions(tactions)) then
+                if action_type == 4 and spell_id and aoe_cc_spells[spell_id] and (not has_actions(tactions)) then
                     local b = spell_to_buff[spell_id]
                     if b and M.is_negative_player_status(b) and target_is_npc then
                         apply_debuff(state, tid, b, nil, nil, spell_id)
