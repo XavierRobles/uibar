@@ -97,7 +97,7 @@ function M.handle_action(act)
         return
     end
 
-    -- Track enemies/NPCs only (matches XIUI intent for mob ToT).
+    -- Mobs/NPCs only.
     if not is_non_player_entity(actor_id) then
         return
     end

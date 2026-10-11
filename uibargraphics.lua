@@ -5,9 +5,16 @@ local debuffs = require('uibardebuffs')
 local party = require('uibarparty')
 local status = require('uibarstatus')
 local actiontracker = require('uibaractiontracker')
+local hate = require('uibarhate')
+local casts = require('uibarcasts')
 local util = require('uibarutil')
 
 local M = {}
+
+-- Cached setters (uibarprim): never call obj:pos/show/... directly on these objects.
+local P = require('uibarprim')
+local g_pos, g_size, g_path, g_color, g_alpha = P.pos, P.size, P.path, P.color, P.alpha
+local g_show, g_hide, g_text, g_extents = P.show, P.hide, P.text, P.extents
 
 local debuff_priority = {
     [173] = 0, -- dread spikes (enemy hazard)
@@ -64,6 +71,46 @@ local function zero_pad3(n)
     return tostring(n)
 end
 
+-- Fallbacks; user colours live in settings.colors.
+local DEFAULT_COLORS = {
+    cast_spell = {175, 135, 255}, -- magic
+    cast_tp = {255, 150, 60},     -- TP move / ability readies
+    cast_sp = {255, 70, 70},      -- two-hour / SP ability used
+    timer_warn = {255, 90, 90},   -- about to wear off
+    timer_other = {150, 200, 255},-- another player's debuff
+}
+local cur_settings = nil -- set at the start of M.update
+
+local function color_of(key)
+    local c = cur_settings and cur_settings.colors and cur_settings.colors[key]
+    if type(c) == 'table' and c.r then
+        return tonumber(c.r) or 0, tonumber(c.g) or 0, tonumber(c.b) or 0
+    end
+    local d = DEFAULT_COLORS[key]
+    return d[1], d[2], d[3]
+end
+
+local function timer_color(remaining, mine)
+    local warn = tonumber(cur_settings and cur_settings.timer_warn_secs or 5) or 5
+    if (remaining or 0) <= warn then
+        return color_of('timer_warn')
+    elseif mine == false then
+        return color_of('timer_other')
+    end
+    return 245, 245, 245
+end
+
+local function cast_color(c)
+    if c.interrupted then
+        return 255, 255, 255
+    end
+    return color_of('cast_' .. (c.kind or 'spell'))
+end
+
+local function casts_enabled()
+    return not (cur_settings and cur_settings.casts and cur_settings.casts.enabled == false)
+end
+
 local function make_bar(name)
     local shadow = images.new(name .. '_shadow')
     local border = images.new(name .. '_border')
@@ -75,19 +122,19 @@ local function make_bar(name)
     for _, prim in ipairs({shadow, border, bg, fg, dmg, heal}) do
         prim:draggable(false)
         prim:fit(true)
-        prim:hide()
+        g_hide(prim)
     end
 
-    shadow:color(0, 0, 0)
-    shadow:alpha(110)
-    border:color(8, 12, 18)
-    border:alpha(230)
-    bg:color(35, 38, 45)
-    bg:alpha(240)
-    dmg:color(255, 40, 40)
-    dmg:alpha(190)
-    heal:color(40, 255, 80)
-    heal:alpha(190)
+    g_color(shadow, 0, 0, 0)
+    g_alpha(shadow, 110)
+    g_color(border, 8, 12, 18)
+    g_alpha(border, 230)
+    g_color(bg, 35, 38, 45)
+    g_alpha(bg, 240)
+    g_color(dmg, 255, 40, 40)
+    g_alpha(dmg, 190)
+    g_color(heal, 40, 255, 80)
+    g_alpha(heal, 190)
 
     return {shadow = shadow, border = border, bg = bg, fg = fg, dmg = dmg, heal = heal}
 end
@@ -107,7 +154,7 @@ local function make_text(color)
         bg = {visible = false},
         flags = {bold = true, right = false},
     })
-    t:hide()
+    g_hide(t)
     return t
 end
 
@@ -126,7 +173,7 @@ local function make_small_text(color)
         bg = {visible = false},
         flags = {bold = true, right = false},
     })
-    t:hide()
+    g_hide(t)
     return t
 end
 
@@ -291,7 +338,7 @@ local function get_target_of_target(target)
             return direct
         end
 
-        -- XIUI-like behavior: action-based tracking is usually most reliable for mobs.
+        -- Action tracking is the most reliable ToT source for mobs.
         local actor_id = to_i(target.id)
         if target.is_npc and actor_id > 0 and actiontracker and actiontracker.get_last_target_index then
             local atix = to_i(actiontracker.get_last_target_index(actor_id))
@@ -371,107 +418,6 @@ local function get_target_of_target(target)
     return out
 end
 
-local function build_party_index_map(ffxi)
-    local map = {}
-    local p = ffxi and ffxi.get_party and ffxi.get_party() or nil
-    if type(p) ~= 'table' then
-        return map
-    end
-    for _, m in pairs(p) do
-        if type(m) == 'table' then
-            local midx = tonumber((m.mob and m.mob.index) or m.index or 0) or 0
-            if midx > 0 then
-                map[midx] = {
-                    id = tonumber((m.mob and m.mob.id) or m.id or 0) or 0,
-                    index = midx,
-                    name = m.name,
-                    is_npc = false,
-                }
-            end
-        end
-    end
-    return map
-end
-
-local function resolve_party_member_by_index(ffxi, idx, party_index_map)
-    idx = tonumber(idx or 0) or 0
-    if idx <= 0 then
-        return nil
-    end
-    if type(party_index_map) == 'table' and party_index_map[idx] then
-        return party_index_map[idx]
-    end
-    return build_party_index_map(ffxi)[idx]
-end
-
-local function get_target_of_target_enemy(target, party_index_map)
-    if not target then
-        return nil
-    end
-
-    local ffxi = windower and windower.ffxi or nil
-    local get_by_index = ffxi and ffxi.get_mob_by_index or nil
-    local get_by_id = ffxi and ffxi.get_mob_by_id or nil
-    if type(get_by_index) ~= 'function' then
-        return nil
-    end
-
-    local function to_i(v)
-        return tonumber(v or 0) or 0
-    end
-
-    local function resolve_by_index(idx)
-        if idx <= 0 then
-            return nil
-        end
-        local m = get_by_index(idx)
-        if m and m.name and m.name ~= '' then
-            return m
-        end
-        return resolve_party_member_by_index(ffxi, idx, party_index_map)
-    end
-
-    local tix = to_i(target.target_index or target.targ_index or target['Target Index'] or target.TargetedIndex or target.targeted_index or target['Targeted Index'])
-    if tix > 0 then
-        local m = resolve_by_index(tix)
-        if m then
-            return m
-        end
-    end
-
-    local tid = to_i(target.target_id or target.targ_id or target['Target ID'] or target.TargetedId or target.targeted_id or target['Targeted ID'])
-    if tid > 0 and type(get_by_id) == 'function' then
-        local m = get_by_id(tid)
-        if m and m.name and m.name ~= '' then
-            return m
-        end
-    end
-
-    local traw = to_i(target.target)
-    if traw > 0 then
-        local m = resolve_by_index(traw)
-        if m then
-            return m
-        end
-        if type(get_by_id) == 'function' then
-            local m2 = get_by_id(traw)
-            if m2 and m2.name and m2.name ~= '' then
-                return m2
-            end
-        end
-    end
-
-    local actor_id = to_i(target.id)
-    if target.is_npc and actor_id > 0 and actiontracker and actiontracker.get_last_target_index then
-        local atix = to_i(actiontracker.get_last_target_index(actor_id))
-        if atix > 0 then
-            return resolve_by_index(atix)
-        end
-    end
-
-    return nil
-end
-
 local function make_timer_text()
     local t = texts.new('', {
         pos = {x = 0, y = 0},
@@ -487,7 +433,7 @@ local function make_timer_text()
         bg = {visible = false},
         flags = {bold = true, right = false},
     })
-    t:hide()
+    g_hide(t)
     return t
 end
 
@@ -523,27 +469,27 @@ local function make_tooltip_text()
         flags = {bold = false, right = false},
         padding = 4,
     })
-    t:hide()
+    g_hide(t)
     return t
 end
 
 local function set_bar(bar, x, y, w, h, value, max_value, r, g, b)
     local border_pad = 1
-    bar.shadow:hide()
+    g_hide(bar.shadow)
 
-    bar.border:pos(x - border_pad, y - border_pad)
-    bar.border:size(w + border_pad * 2, h + border_pad * 2)
-    bar.border:show()
+    g_pos(bar.border, x - border_pad, y - border_pad)
+    g_size(bar.border, w + border_pad * 2, h + border_pad * 2)
+    g_show(bar.border)
 
-    bar.bg:pos(x, y)
-    bar.bg:size(w, h)
-    bar.bg:show()
+    g_pos(bar.bg, x, y)
+    g_size(bar.bg, w, h)
+    g_show(bar.bg)
 
     local fw = pct_to_width(value, max_value, w)
-    bar.fg:pos(x, y)
-    bar.fg:size(fw, h)
-    bar.fg:color(r, g, b)
-    bar.fg:show()
+    g_pos(bar.fg, x, y)
+    g_size(bar.fg, fw, h)
+    g_color(bar.fg, r, g, b)
+    g_show(bar.fg)
 end
 
 local function is_call_for_help(target)
@@ -568,10 +514,6 @@ local function is_mob_entity(entity)
         return true
     end
     return entity_spawn_type(entity) == 16
-end
-
-local function is_trust_entity(entity)
-    return entity_spawn_type(entity) == 14
 end
 
 local NON_HOSTILE_NPC_SPAWNS = {
@@ -650,16 +592,16 @@ local function draw_trails(bar, x, y, h, dt, state)
         end
         if alpha > 0 then
             local dw = state.damage_flash_to - state.damage_flash_from
-            bar.dmg:pos(x + state.damage_flash_from, y)
-            bar.dmg:size(dw, h)
-            bar.dmg:alpha(alpha)
-            bar.dmg:show()
+            g_pos(bar.dmg, x + state.damage_flash_from, y)
+            g_size(bar.dmg, dw, h)
+            g_alpha(bar.dmg, alpha)
+            g_show(bar.dmg)
         else
-            bar.dmg:hide()
+            g_hide(bar.dmg)
         end
     else
         state.damage_flash_timer = 0
-        bar.dmg:hide()
+        g_hide(bar.dmg)
     end
 
     if state.heal_flash_timer and state.heal_flash_timer > 0 and state.heal_flash_from and state.heal_flash_to and state.heal_flash_to > state.heal_flash_from then
@@ -670,26 +612,26 @@ local function draw_trails(bar, x, y, h, dt, state)
         end
         if alpha > 0 then
             local hw = state.heal_flash_to - state.heal_flash_from
-            bar.heal:pos(x + state.heal_flash_from, y)
-            bar.heal:size(hw, h)
-            bar.heal:alpha(alpha)
-            bar.heal:show()
+            g_pos(bar.heal, x + state.heal_flash_from, y)
+            g_size(bar.heal, hw, h)
+            g_alpha(bar.heal, alpha)
+            g_show(bar.heal)
         else
-            bar.heal:hide()
+            g_hide(bar.heal)
         end
     else
         state.heal_flash_timer = 0
-        bar.heal:hide()
+        g_hide(bar.heal)
     end
 end
 
 local function hide_bar(bar)
-    bar.shadow:hide()
-    bar.border:hide()
-    bar.bg:hide()
-    bar.fg:hide()
-    bar.dmg:hide()
-    bar.heal:hide()
+    g_hide(bar.shadow)
+    g_hide(bar.border)
+    g_hide(bar.bg)
+    g_hide(bar.fg)
+    g_hide(bar.dmg)
+    g_hide(bar.heal)
 end
 
 local function icon_path(state, buff_id)
@@ -717,7 +659,7 @@ local function ensure_pool(pool, count)
         local icon = images.new()
         icon:draggable(false)
         icon:fit(false)
-        icon:hide()
+        g_hide(icon)
         pool[i] = icon
     end
 end
@@ -772,43 +714,44 @@ local function show_icon_grid(state, icon_pool, timer_pool, mark_pool, entries, 
             local row = math.floor((shown - 1) / per_row)
             local px = x + col * (size + spacing)
             local py = y + row * row_h
-            icon:path(path)
-            icon:pos(px, py)
-            icon:size(size, size)
-            icon:show()
+            g_path(icon, path)
+            g_pos(icon, px, py)
+            g_size(icon, size, size)
+            g_show(icon)
             state.visible_icon_entries[shown] = {icon = icon, entry = entry}
 
             if show_timers then
                 local ttxt = format_remaining(entry.remaining or 0)
-                timer:text(ttxt)
-                local tw = timer:extents() or (#ttxt * 5)
-                timer:pos(px + math.floor((size - tw) * 0.5), py + size)
-                timer:show()
+                g_text(timer, ttxt)
+                g_color(timer, timer_color(entry.remaining, entry.mine))
+                local tw = g_extents(timer) or (#ttxt * 5)
+                g_pos(timer, px + math.floor((size - tw) * 0.5), py + size)
+                g_show(timer)
             else
-                timer:hide()
+                g_hide(timer)
             end
 
             local mark = mark_pool[shown]
             local lbl = debuff_tier_label(id, entry.mark)
             if mark and lbl then
-                mark:text(lbl)
-                pcall(function() mark:color(250, 220, 90) end)
-                mark:pos(px + size - 6, py + size - 8)
-                mark:show()
+                g_text(mark, lbl)
+                g_color(mark, 250, 220, 90)
+                g_pos(mark, px + size - 6, py + size - 8)
+                g_show(mark)
             elseif mark then
-                mark:hide()
+                g_hide(mark)
             end
         end
     end
 
     for i = shown + 1, #icon_pool do
-        icon_pool[i]:hide()
+        g_hide(icon_pool[i])
     end
     for i = shown + 1, #timer_pool do
-        timer_pool[i]:hide()
+        g_hide(timer_pool[i])
     end
     for i = shown + 1, #mark_pool do
-        mark_pool[i]:hide()
+        g_hide(mark_pool[i])
     end
     for i = shown + 1, #state.visible_icon_entries do
         state.visible_icon_entries[i] = nil
@@ -817,13 +760,13 @@ end
 
 local function hide_pool(pool)
     for i = 1, #pool do
-        pool[i]:hide()
+        g_hide(pool[i])
     end
 end
 
 local function hide_text_pool(pool)
     for i = 1, #pool do
-        pool[i]:hide()
+        g_hide(pool[i])
     end
 end
 
@@ -834,6 +777,7 @@ local function ensure_enemy_row(state, idx)
             name = make_small_text({235, 235, 235}),
             info = make_small_text({215, 215, 215}),
             tot = make_small_text({190, 220, 255}),
+            cast = make_small_text({255, 150, 60}),
             icons = {},
             itimes = {},
             imarks = {},
@@ -846,16 +790,17 @@ local function hide_enemy_rows(state)
     for i = 1, #state.enemy_rows do
         local row = state.enemy_rows[i]
         hide_bar(row.hp)
-        row.name:hide()
-        row.info:hide()
-        row.tot:hide()
+        g_hide(row.name)
+        g_hide(row.info)
+        g_hide(row.tot)
+        g_hide(row.cast)
         hide_pool(row.icons)
         hide_text_pool(row.itimes)
         hide_text_pool(row.imarks)
     end
-    state.enemy_title:hide()
+    g_hide(state.enemy_title)
     if state.enemy_drag then
-        state.enemy_drag:hide()
+        g_hide(state.enemy_drag)
     end
 end
 
@@ -865,11 +810,11 @@ function M.create(settings)
     local enemydrag = images.new('uibar_enemy_drag')
     targetjobicon:draggable(false)
     targetjobicon:fit(false)
-    targetjobicon:hide()
+    g_hide(targetjobicon)
     enemydrag:draggable(false)
     enemydrag:fit(true)
-    enemydrag:alpha(0)
-    enemydrag:hide()
+    g_alpha(enemydrag, 0)
+    g_hide(enemydrag)
     return {
         icon_root = addon_path .. 'images/icons/',
         icon_path_cache = {},
@@ -879,6 +824,8 @@ function M.create(settings)
         target_dist = make_text({235, 235, 235}),
         target_pct = make_text({245, 245, 245}),
         tooltip = make_tooltip_text(),
+        target_cast = make_bar('uibar_target_cast'),
+        target_cast_text = make_small_text({255, 150, 60}),
         target_job_icon = targetjobicon,
         job_icon_cache = {},
         target_debuffs = {},
@@ -910,12 +857,14 @@ function M.hide(state)
         return
     end
     hide_bar(state.target_hp)
-    state.target_name:hide()
-    state.target_tot:hide()
-    state.target_dist:hide()
-    state.target_pct:hide()
-    state.tooltip:hide()
-    state.target_job_icon:hide()
+    g_hide(state.target_name)
+    g_hide(state.target_tot)
+    g_hide(state.target_dist)
+    g_hide(state.target_pct)
+    g_hide(state.tooltip)
+    hide_bar(state.target_cast)
+    g_hide(state.target_cast_text)
+    g_hide(state.target_job_icon)
     hide_pool(state.target_debuffs)
     hide_text_pool(state.target_debuff_times)
     hide_text_pool(state.target_debuff_marks)
@@ -938,6 +887,10 @@ function M.destroy(state)
     pcall(function() state.target_dist:destroy() end)
     pcall(function() state.target_pct:destroy() end)
     pcall(function() state.tooltip:destroy() end)
+    pcall(function() state.target_cast_text:destroy() end)
+    for _, k in ipairs({'shadow', 'border', 'bg', 'fg', 'dmg', 'heal'}) do
+        pcall(function() state.target_cast[k]:destroy() end)
+    end
     pcall(function() state.target_job_icon:destroy() end)
     for _, pool in ipairs({state.target_debuffs}) do
         for i = 1, #pool do
@@ -965,6 +918,7 @@ function M.destroy(state)
             pcall(function() row.name:destroy() end)
             pcall(function() row.info:destroy() end)
             pcall(function() row.tot:destroy() end)
+            pcall(function() row.cast:destroy() end)
             for k = 1, #row.icons do
                 pcall(function() row.icons[k]:destroy() end)
             end
@@ -1119,9 +1073,9 @@ local function update_tooltip(state, mouse_x, mouse_y)
     if jobhit and jobhit.icon and jobhit.icon:hover(mouse_x, mouse_y) then
         local tip = jobhit.tooltip or ''
         local text = (tip ~= '') and string.format('%s\n%s', jobhit.title or '', tip) or (jobhit.title or '')
-        state.tooltip:text(text)
-        state.tooltip:pos((mouse_x or 0) + 14, (mouse_y or 0) + 14)
-        state.tooltip:show()
+        g_text(state.tooltip, text)
+        g_pos(state.tooltip, (mouse_x or 0) + 14, (mouse_y or 0) + 14)
+        g_show(state.tooltip)
         return
     end
 
@@ -1136,9 +1090,9 @@ local function update_tooltip(state, mouse_x, mouse_y)
 
     if hit_detect then
         local text = string.format('%s\n%s', hit_detect.title or 'Detection', hit_detect.tooltip or '')
-        state.tooltip:text(text)
-        state.tooltip:pos((mouse_x or 0) + 14, (mouse_y or 0) + 14)
-        state.tooltip:show()
+        g_text(state.tooltip, text)
+        g_pos(state.tooltip, (mouse_x or 0) + 14, (mouse_y or 0) + 14)
+        g_show(state.tooltip)
         return
     end
 
@@ -1152,7 +1106,7 @@ local function update_tooltip(state, mouse_x, mouse_y)
     end
 
     if not hit then
-        state.tooltip:hide()
+        g_hide(state.tooltip)
         return
     end
 
@@ -1163,187 +1117,9 @@ local function update_tooltip(state, mouse_x, mouse_y)
         local rem = math.max(0, math.floor((hit.remaining or 0) + 0.5))
         text = string.format('%s\nRem: %ds', text, rem)
     end
-    state.tooltip:text(text)
-    state.tooltip:pos((mouse_x or 0) + 14, (mouse_y or 0) + 14)
-    state.tooltip:show()
-end
-
-local function collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids, ally_ids, all_ids)
-    local ffxi = windower and windower.ffxi or nil
-    local mobs = ffxi and ffxi.get_mob_array and ffxi.get_mob_array() or nil
-    if not mobs then
-        return {}
-    end
-    logic_state = logic_state or {}
-    if not party_ids or not ally_ids or not all_ids then
-        party_ids, ally_ids, all_ids = party.get_claim_sets()
-    end
-    logic_state.enemy_target_cache = logic_state.enemy_target_cache or {}
-    local cache = logic_state.enemy_target_cache
-    local now_ts = os.time()
-    local now_u = util.unix_now()
-    local max_visible_sq = 50 * 50
-    local no_target_clear_secs = 8
-    local party_touch_grace_secs = 45
-    local party_index_map = build_party_index_map(ffxi)
-    local alive = {}
-
-    local rows = {}
-    local function should_skip_enemy_entity(mob, all_ids_set)
-        local mid = tonumber(mob and mob.id or 0) or 0
-        if mid <= 0 then
-            return true
-        end
-        if all_ids_set and all_ids_set[mid] then
-            return true
-        end
-        if mob and (mob.in_party == true or mob.in_alliance == true) then
-            return true
-        end
-        if is_trust_entity(mob) then
-            return true
-        end
-        if not is_mob_entity(mob) then
-            return true
-        end
-        return false
-    end
-
-    local function has_active_debuff(mid)
-        local dset = logic_state and logic_state.mob_debuffs and logic_state.mob_debuffs[mid] or nil
-        if type(dset) ~= 'table' then
-            return false
-        end
-        local now_u = util.unix_now()
-        for buff_id, expires in pairs(dset) do
-            if tonumber(expires or 0) > now_u and debuffs.is_negative_player_status and debuffs.is_negative_player_status(buff_id) then
-                return true
-            end
-        end
-        return false
-    end
-
-    for _, mob in pairs(mobs) do
-        if mob and mob.valid_target and tonumber(mob.hpp or 0) > 0 and mob.distance and (not should_skip_enemy_entity(mob, all_ids)) then
-            local mid = tonumber(mob.id or 0) or 0
-            local within = mob.distance <= max_visible_sq
-            if not within and mid > 0 then
-                cache[mid] = nil
-                if logic_state.mob_party_touch then
-                    logic_state.mob_party_touch[mid] = nil
-                end
-            end
-            if within then
-                alive[mid] = true
-                local tgt = get_target_of_target_enemy(mob, party_index_map)
-                local tid = tonumber(tgt and tgt.id or 0) or 0
-                local claim_id = tonumber(mob.claim_id or 0) or 0
-                local claim_is_ours = claim_id > 0 and ((party_ids and party_ids[claim_id]) or (ally_ids and ally_ids[claim_id])) or false
-                local touched_at = logic_state.mob_party_touch and tonumber(logic_state.mob_party_touch[mid] or 0) or 0
-                local party_touch_recent = touched_at > 0 and (now_u - touched_at) <= party_touch_grace_secs
-                local debuff_active = has_active_debuff(mid)
-
-                if tid > 0 and all_ids and all_ids[tid] then
-                    if mid > 0 then
-                        cache[mid] = {
-                            id = tid,
-                            name = tostring(tgt.name or ''),
-                            seen_at = now_ts,
-                            last_target_at = now_ts,
-                        }
-                    end
-                    rows[#rows + 1] = {
-                        mob = mob,
-                        target = tgt,
-                        distance = math.sqrt(math.max(0, mob.distance or 0)),
-                        hpp = tonumber(mob.hpp or 0) or 0,
-                        party_ids = party_ids,
-                        ally_ids = ally_ids,
-                    }
-                elseif tid > 0 and mid > 0 then
-                    -- Mob currently targets someone outside party/alliance: treat as not ours.
-                    cache[mid] = nil
-                elseif party_touch_recent or (debuff_active and (claim_id == 0 or claim_is_ours)) then
-                    local c = cache[mid]
-                    rows[#rows + 1] = {
-                        mob = mob,
-                        target = c and {
-                            id = tonumber(c.id or 0) or 0,
-                            name = c.name or '',
-                            is_npc = false,
-                        } or nil,
-                        distance = math.sqrt(math.max(0, mob.distance or 0)),
-                        hpp = tonumber(mob.hpp or 0) or 0,
-                        party_ids = party_ids,
-                        ally_ids = ally_ids,
-                    }
-                elseif mid > 0 then
-                    local c = cache[mid]
-                    if c and all_ids and all_ids[tonumber(c.id or 0) or 0] then
-                        -- If mob has no visible target and no claim for a while, consider hate lost.
-                        local last_target_at = tonumber(c.last_target_at or c.seen_at or now_ts) or now_ts
-                        if claim_id == 0 and (now_ts - last_target_at) > no_target_clear_secs then
-                            cache[mid] = nil
-                        else
-                            c.seen_at = now_ts
-                            cache[mid] = c
-                            rows[#rows + 1] = {
-                                mob = mob,
-                                target = {
-                                    id = tonumber(c.id or 0) or 0,
-                                    name = c.name or '',
-                                    is_npc = false,
-                                },
-                                distance = math.sqrt(math.max(0, mob.distance or 0)),
-                                hpp = tonumber(mob.hpp or 0) or 0,
-                                party_ids = party_ids,
-                                ally_ids = ally_ids,
-                            }
-                        end
-                    else
-                        cache[mid] = nil
-                    end
-                end
-            end
-        elseif mob and tonumber(mob.id or 0) and tonumber(mob.id or 0) > 0 then
-            -- Dead or invalid mobs should be removed from cache.
-            local dead_id = tonumber(mob.id)
-            cache[dead_id] = nil
-            if logic_state.mob_party_touch then
-                logic_state.mob_party_touch[dead_id] = nil
-            end
-        end
-    end
-
-    -- Cleanup cache entries that no longer have a corresponding visible mob entity.
-    for mid, _ in pairs(cache) do
-        if not alive[mid] then
-            cache[mid] = nil
-            if logic_state.mob_party_touch then
-                logic_state.mob_party_touch[mid] = nil
-            end
-        end
-    end
-
-    table.sort(rows, function(a, b)
-        if a.distance ~= b.distance then
-            return a.distance < b.distance
-        end
-        if a.hpp ~= b.hpp then
-            return a.hpp < b.hpp
-        end
-        return tostring(a.mob.name or '') < tostring(b.mob.name or '')
-    end)
-
-    local maxn = math.max(1, tonumber(settings.max_enemies or 8) or 8)
-    if #rows > maxn then
-        local out = {}
-        for i = 1, maxn do
-            out[i] = rows[i]
-        end
-        return out
-    end
-    return rows
+    g_text(state.tooltip, text)
+    g_pos(state.tooltip, (mouse_x or 0) + 14, (mouse_y or 0) + 14)
+    g_show(state.tooltip)
 end
 
 local function get_cached_sorted_debuff_entries(logic_state, mob_id, now)
@@ -1412,6 +1188,7 @@ local function get_cached_player_entries(target, logic_state, now, max_items)
 end
 
 function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
+    cur_settings = settings
     if not settings.graphics.enabled then
         M.hide(state)
         return
@@ -1488,7 +1265,7 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         local idx_text = '---'
         local sid = tonumber(target.id)
         if sid then
-            -- Match common mobdb/xiui style: lower 12 bits of server id in hex, no 0x prefix.
+            -- Lower 12 bits of the server id in hex (mobdb style).
             idx_text = string.format('%03X', sid % 0x1000)
         end
         local is_npc = target.is_npc and true or false
@@ -1506,13 +1283,11 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         end
         local dist_text = string.format('%.1f', distance)
         local pct_text = string.format('%d%%', hpp)
-        pcall(function()
-            state.target_name:color(nr, ng, nb)
-        end)
-        state.target_name:text(name)
-        state.target_name:pos(tbar_x, tbar_y - 20)
-        state.target_name:show()
-        local name_w = state.target_name:extents() or (#name * 6)
+        g_color(state.target_name, nr, ng, nb)
+        g_text(state.target_name, name)
+        g_pos(state.target_name, tbar_x, tbar_y - 20)
+        g_show(state.target_name)
+        local name_w = g_extents(state.target_name) or (#name * 6)
         local di_size = math.max(16, math.floor((icon_cfg.size or 18) * 0.90 + 0.5))
         local job_size = di_size + 2
         local dx = tbar_x + name_w + 8
@@ -1521,10 +1296,10 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         if is_npc then
             local jp = job_icon_path(state, job)
             if jp then
-                state.target_job_icon:path(jp)
-                state.target_job_icon:pos(dx, dy)
-                state.target_job_icon:size(job_size, job_size)
-                state.target_job_icon:show()
+                g_path(state.target_job_icon, jp)
+                g_pos(state.target_job_icon, dx, dy)
+                g_size(state.target_job_icon, job_size, job_size)
+                g_show(state.target_job_icon)
                 state.visible_job_entry = {
                     icon = state.target_job_icon,
                     title = job or '',
@@ -1532,17 +1307,17 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
                 }
                 dx = dx + job_size + 3
             else
-                state.target_job_icon:hide()
+                g_hide(state.target_job_icon)
                 state.visible_job_entry = nil
                 if job and job ~= '' then
                     name = name .. ' ' .. tostring(job)
-                    state.target_name:text(name)
-                    name_w = state.target_name:extents() or (#name * 6)
+                    g_text(state.target_name, name)
+                    name_w = g_extents(state.target_name) or (#name * 6)
                     dx = tbar_x + name_w + 8
                 end
             end
         else
-            state.target_job_icon:hide()
+            g_hide(state.target_job_icon)
             state.visible_job_entry = nil
         end
 
@@ -1553,10 +1328,10 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
             local icon = state.target_detect_icons[i]
             local p = detect_icon_path(state, e.file)
             if p then
-                icon:path(p)
-                icon:pos(dx, dy)
-                icon:size(di_size, di_size)
-                icon:show()
+                g_path(icon, p)
+                g_pos(icon, dx, dy)
+                g_size(icon, di_size, di_size)
+                g_show(icon)
                 state.visible_detect_entries[i] = {
                     icon = icon,
                     title = e.title,
@@ -1564,28 +1339,27 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
                 }
                 dx = dx + di_size + 2
             else
-                icon:hide()
+                g_hide(icon)
                 state.visible_detect_entries[i] = nil
             end
         end
         for i = #det_entries + 1, #state.target_detect_icons do
-            state.target_detect_icons[i]:hide()
+            g_hide(state.target_detect_icons[i])
             state.visible_detect_entries[i] = nil
         end
 
-        state.target_dist:text(dist_text)
-        local dist_w = state.target_dist:extents()
+        g_text(state.target_dist, dist_text)
+        local dist_w = g_extents(state.target_dist)
         dist_w = dist_w or (#dist_text * 6)
-        state.target_dist:pos(tbar_x + bar_cfg.width - dist_w, tbar_y - 22)
-        state.target_dist:show()
+        g_pos(state.target_dist, tbar_x + bar_cfg.width - dist_w, tbar_y - 22)
+        g_show(state.target_dist)
 
         state.tot_cache = state.tot_cache or {target_id = 0, value = nil, expires = 0}
         local target_id_num = tonumber(target.id or 0) or 0
-        local me = windower.ffxi.get_player()
-        local my_id = tonumber(me and me.id or 0) or 0
+        local my_id = util.player_id()
         local tot = nil
         if my_id > 0 and target_id_num == my_id then
-            -- XIUI-style behavior: self-target always points to self.
+            -- Self-target always points to self.
             tot = target
             state.tot_cache.target_id = target_id_num
             state.tot_cache.value = tot
@@ -1600,26 +1374,24 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         end
         if tot and tot.name and tot.name ~= '' then
             local tr, tg, tb = target_name_color(tot, party_ids, ally_ids)
-            pcall(function()
-                state.target_tot:color(tr, tg, tb)
-            end)
-            state.target_tot:text('-> ' .. short_name(tot.name, 20))
-            local _, tot_h = state.target_tot:extents()
+            g_color(state.target_tot, tr, tg, tb)
+            g_text(state.target_tot, '-> ' .. short_name(tot.name, 20))
+            local _, tot_h = g_extents(state.target_tot)
             tot_h = tot_h or 10
             local tot_y = tbar_y + math.floor(((bar_cfg.height + 2) - tot_h) * 0.5) - 1
-            state.target_tot:pos(tbar_x + bar_cfg.width + 10, tot_y)
-            state.target_tot:show()
+            g_pos(state.target_tot, tbar_x + bar_cfg.width + 10, tot_y)
+            g_show(state.target_tot)
         else
-            state.target_tot:hide()
+            g_hide(state.target_tot)
         end
 
-        state.target_pct:text(pct_text)
-        local pct_w = state.target_pct:extents()
-        local pct_h = select(2, state.target_pct:extents())
+        g_text(state.target_pct, pct_text)
+        local pct_w = g_extents(state.target_pct)
+        local pct_h = select(2, g_extents(state.target_pct))
         pct_w = pct_w or (#pct_text * 6)
         pct_h = pct_h or 10
-        state.target_pct:pos(tbar_x + math.floor((bar_cfg.width - pct_w) * 0.5), tbar_y + math.floor(((bar_cfg.height + 2) - pct_h) * 0.5) - 1)
-        state.target_pct:show()
+        g_pos(state.target_pct, tbar_x + math.floor((bar_cfg.width - pct_w) * 0.5), tbar_y + math.floor(((bar_cfg.height + 2) - pct_h) * 0.5) - 1)
+        g_show(state.target_pct)
 
         local entries
         local show_timers = true
@@ -1645,14 +1417,43 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
             show_timers
         )
         update_tooltip(state, mouse_x, mouse_y)
+
+        local tc = is_npc and casts_enabled() and casts.get(target.id) or nil
+        if tc then
+            local label = tc.name
+            local ct = (not tc.interrupted) and tonumber(tc.target_id or 0) or 0
+            if ct > 0 and ct ~= tonumber(target.id) then
+                local cm = windower.ffxi.get_mob_by_id(ct)
+                if cm and cm.name and cm.name ~= '' then
+                    label = label .. ' -> ' .. short_name(cm.name, 16)
+                end
+            end
+            local cr, cg, cb = cast_color(tc)
+            -- Right-aligned under the HP bar: debuff icons grow from the left.
+            local cw = math.floor(math.min(180, bar_cfg.width * 0.35))
+            local right = tbar_x + bar_cfg.width
+            local cast_y = tbar_y + bar_cfg.height + 2 + 3
+            set_bar(state.target_cast, right - cw, cast_y, cw, 4, math.floor(tc.progress * 100 + 0.5), 100, cr, cg, cb)
+            g_text(state.target_cast_text, label)
+            g_color(state.target_cast_text, cr, cg, cb)
+            local tw = g_extents(state.target_cast_text) or (#label * 6)
+            g_pos(state.target_cast_text, right - tw, cast_y + 6)
+            g_show(state.target_cast_text)
+            g_alpha(state.target_cast.fg, math.floor(255 * (tc.alpha or 1)))
+        else
+            hide_bar(state.target_cast)
+            g_hide(state.target_cast_text)
+        end
     else
+        hide_bar(state.target_cast)
+        g_hide(state.target_cast_text)
         hide_bar(state.target_hp)
-        state.target_name:hide()
-        state.target_tot:hide()
-        state.target_dist:hide()
-        state.target_pct:hide()
-        state.tooltip:hide()
-        state.target_job_icon:hide()
+        g_hide(state.target_name)
+        g_hide(state.target_tot)
+        g_hide(state.target_dist)
+        g_hide(state.target_pct)
+        g_hide(state.tooltip)
+        g_hide(state.target_job_icon)
         state.visible_job_entry = nil
         hide_pool(state.target_debuffs)
         hide_text_pool(state.target_debuff_times)
@@ -1666,11 +1467,11 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         state.tot_cache = nil
     end
 
-    -- Enemy list (graphical): cache expensive mob scan briefly to reduce per-frame load.
+    -- The mob scan is expensive: refresh it every 0.3s.
     local enemy_refresh = 0.30
     logic_state.enemy_rows_cache = logic_state.enemy_rows_cache or {}
     if now >= (logic_state.enemy_rows_next_at or 0) then
-        logic_state.enemy_rows_cache = collect_enemy_aggro_rows(settings, mobdb, logic_state, party_ids, ally_ids, all_ids)
+        logic_state.enemy_rows_cache = hate.collect(settings, logic_state)
         logic_state.enemy_rows_next_at = now + enemy_refresh
     end
     local erows = logic_state.enemy_rows_cache
@@ -1683,12 +1484,12 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
     local icon_gap = 1
     local selected_enemy_id = tonumber(target and target.id or 0) or 0
 
-    state.enemy_title:hide()
+    g_hide(state.enemy_title)
     if state.enemy_drag then
         local drag_h = math.max(22, 8 + (#erows * row_gap))
-        state.enemy_drag:pos(ex, ey - 10)
-        state.enemy_drag:size(ew + 240, drag_h)
-        state.enemy_drag:show()
+        g_pos(state.enemy_drag, ex, ey - 10)
+        g_size(state.enemy_drag, ew + 240, drag_h)
+        g_show(state.enemy_drag)
     end
 
     for i = 1, #erows do
@@ -1701,50 +1502,60 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
         local mr, mg, mb = health_color(e.hpp)
         set_bar(row.hp, ex, y + 9, ew, eh, e.hpp, 100, mr, mg, mb)
         if is_selected then
-            row.hp.border:color(255, 222, 120)
-            row.hp.border:alpha(255)
-            row.hp.bg:color(52, 56, 70)
-            row.hp.bg:alpha(250)
+            g_color(row.hp.border, 255, 222, 120)
+            g_alpha(row.hp.border, 255)
+            g_color(row.hp.bg, 52, 56, 70)
+            g_alpha(row.hp.bg, 250)
         else
-            row.hp.border:color(8, 12, 18)
-            row.hp.border:alpha(230)
-            row.hp.bg:color(35, 38, 45)
-            row.hp.bg:alpha(240)
+            g_color(row.hp.border, 8, 12, 18)
+            g_alpha(row.hp.border, 230)
+            g_color(row.hp.bg, 35, 38, 45)
+            g_alpha(row.hp.bg, 240)
         end
 
         local nr, ng, nb = target_name_color(e.mob, e.party_ids, e.ally_ids)
         local row_name = short_name(e.mob.name or 'Mob', 30)
         if is_selected then
             row_name = '> ' .. row_name
-            pcall(function() row.name:color(math.min(255, nr + 35), math.min(255, ng + 35), math.min(255, nb + 35)) end)
+            g_color(row.name, math.min(255, nr + 35), math.min(255, ng + 35), math.min(255, nb + 35))
         else
-            pcall(function() row.name:color(nr, ng, nb) end)
+            g_color(row.name, nr, ng, nb)
         end
-        row.name:text(row_name)
-        row.name:pos(ex, y - 8)
-        row.name:show()
+        g_text(row.name, row_name)
+        g_pos(row.name, ex, y - 8)
+        g_show(row.name)
 
-        row.info:text(string.format('%d%%  %.1f', e.hpp, e.distance))
+        g_text(row.info, string.format('%d%%  %.1f', e.hpp, e.distance))
         if is_selected then
-            pcall(function() row.info:color(255, 232, 150) end)
+            g_color(row.info, 255, 232, 150)
         else
-            pcall(function() row.info:color(215, 215, 215) end)
+            g_color(row.info, 215, 215, 215)
         end
-        local iw = row.info:extents() or 64
-        row.info:pos(ex + ew - iw, y - 8)
-        row.info:show()
+        local iw = g_extents(row.info) or 64
+        g_pos(row.info, ex + ew - iw, y - 8)
+        g_show(row.info)
 
         if e.target and e.target.name and e.target.name ~= '' then
             local tr, tg, tb = target_name_color(e.target, e.party_ids, e.ally_ids)
-            row.tot:text('-> ' .. short_name(e.target.name, 14))
-            pcall(function() row.tot:color(tr, tg, tb) end)
-            local _, row_tot_h = row.tot:extents()
+            g_text(row.tot, '-> ' .. short_name(e.target.name, 14))
+            g_color(row.tot, tr, tg, tb)
+            local _, row_tot_h = g_extents(row.tot)
             row_tot_h = row_tot_h or 8
             local row_tot_y = (y + 9) + math.floor((eh - row_tot_h) * 0.5) - 1
-            row.tot:pos(ex + ew + 8, row_tot_y)
-            row.tot:show()
+            g_pos(row.tot, ex + ew + 8, row_tot_y)
+            g_show(row.tot)
         else
-            row.tot:hide()
+            g_hide(row.tot)
+        end
+
+        local rc = casts_enabled() and casts.get(mob_id) or nil
+        if rc then
+            g_text(row.cast, short_name(rc.name, 18))
+            g_color(row.cast, cast_color(rc))
+            g_pos(row.cast, ex + ew + 8, y - 8)
+            g_show(row.cast)
+        else
+            g_hide(row.cast)
         end
 
         local dents = get_cached_sorted_debuff_entries(logic_state, e.mob.id, now)
@@ -1760,54 +1571,56 @@ function M.update(state, settings, logic_state, mobdb, mouse_x, mouse_y)
             if p then
                 shown = shown + 1
                 local ic = row.icons[shown]
-                ic:path(p)
-                ic:size(icon_size, icon_size)
+                g_path(ic, p)
+                g_size(ic, icon_size, icon_size)
                 local ix = ex + (shown - 1) * (icon_size + icon_gap)
                 local iy = y + eh + 12
-                ic:pos(ix, iy)
-                ic:show()
+                g_pos(ic, ix, iy)
+                g_show(ic)
 
                 local rt = tonumber(de.remaining or 0) or 0
                 local tt = row.itimes[shown]
                 if rt > 0 then
                     local txt = (rt >= 99) and '1+' or tostring(math.floor(rt + 0.5))
-                    tt:text(txt)
-                    local tw = tt:extents() or (#txt * 5)
-                    tt:pos(ix + math.floor((icon_size - tw) * 0.5), iy + icon_size)
-                    tt:show()
+                    g_text(tt, txt)
+                    g_color(tt, timer_color(rt, de.mine))
+                    local tw = g_extents(tt) or (#txt * 5)
+                    g_pos(tt, ix + math.floor((icon_size - tw) * 0.5), iy + icon_size)
+                    g_show(tt)
                 else
-                    tt:hide()
+                    g_hide(tt)
                 end
 
                 local mk = row.imarks[shown]
                 local ml = debuff_tier_label(did, de.mark)
                 if mk and ml then
-                    mk:text(ml)
-                    pcall(function() mk:color(250, 220, 90) end)
-                    mk:pos(ix + icon_size - 6, iy + icon_size - 8)
-                    mk:show()
+                    g_text(mk, ml)
+                    g_color(mk, 250, 220, 90)
+                    g_pos(mk, ix + icon_size - 6, iy + icon_size - 8)
+                    g_show(mk)
                 elseif mk then
-                    mk:hide()
+                    g_hide(mk)
                 end
             end
         end
         for j = shown + 1, #row.icons do
-            row.icons[j]:hide()
+            g_hide(row.icons[j])
         end
         for j = shown + 1, #row.itimes do
-            row.itimes[j]:hide()
+            g_hide(row.itimes[j])
         end
         for j = shown + 1, #row.imarks do
-            row.imarks[j]:hide()
+            g_hide(row.imarks[j])
         end
     end
 
     for i = #erows + 1, #state.enemy_rows do
         local row = state.enemy_rows[i]
         hide_bar(row.hp)
-        row.name:hide()
-        row.info:hide()
-        row.tot:hide()
+        g_hide(row.name)
+        g_hide(row.info)
+        g_hide(row.tot)
+        g_hide(row.cast)
         hide_pool(row.icons)
         hide_text_pool(row.itimes)
         hide_text_pool(row.imarks)

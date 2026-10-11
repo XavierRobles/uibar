@@ -1,5 +1,6 @@
 local M = {}
 local bit = require('bit')
+local util = require('uibarutil')
 
 local party_buffs = {}
 local name_to_id = {}
@@ -97,11 +98,10 @@ function M.collecttargetbuffids(target)
         return out
     end
 
-    local me = windower.ffxi.get_player()
     local tid = tonumber(target.id or 0) or 0
-    local myid = tonumber(me and me.id or 0) or 0
-    if me and tid > 0 and tid == myid then
-        merge_set(out, me.buffs)
+    if tid > 0 and tid == util.player_id() then
+        local me = windower.ffxi.get_player()
+        merge_set(out, me and me.buffs)
         return out
     end
 

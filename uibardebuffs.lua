@@ -8,11 +8,30 @@ local M = {}
 
 local status_on_messages = S{
     101, 127, 160, 164, 166, 186, 194, 203, 205, 230, 236, 266, 267, 268, 269,
-    237, 271, 272, 277, 278, 279, 280, 319, 320, 375, 412, 645, 754, 755, 804
+    237, 271, 272, 277, 278, 279, 280, 319, 320, 375, 412, 645, 754, 755, 804, 141
 }
-local status_off_messages = S{64, 159, 168, 204, 206, 321, 322, 341, 342, 343, 344, 350, 378, 531, 647, 805, 806}
+local status_off_messages = S{64, 83, 159, 168, 204, 206, 321, 322, 341, 342, 343, 344, 350, 378, 531, 647, 805, 806}
 local death_messages = S{6, 20, 97, 113, 406, 605, 646}
 local spell_damage_messages = S{2, 252, 264, 265}
+-- Retail Dia/Bio overwrite order. A failed overwrite still deals damage, so damage alone is not proof.
+local dot_priority = {
+    [23] = 1, [33] = 1, -- Dia, Diaga
+    [230] = 2,          -- Bio
+    [24] = 3,           -- Dia II
+    [231] = 4,          -- Bio II
+    [25] = 5,           -- Dia III
+    [232] = 6,          -- Bio III
+}
+-- Natural wear-off messages (used to learn real durations).
+local natural_wear_messages = S{204, 206}
+-- Often broken early (damage wakes/unbinds): learn upward only.
+local early_ending_buffs = S{2, 10, 11, 19, 193}
+local sleep_family_ids = {2, 19, 193}
+local learned_duration = {}
+local PARTY_TOUCH_KEEP_SECS = 60
+local monster_ability_status_overrides = {
+    [3564] = 173, -- Aetheric Pull -> Dread Spikes
+}
 
 local known_debuff_duration = {
     [2] = 60, [3] = 120, [4] = 120, [5] = 180, [6] = 120, [10] = 5, [11] = 60, [12] = 120, [13] = 180,
@@ -20,7 +39,7 @@ local known_debuff_duration = {
     [134] = 150, [135] = 150, [147] = 180, [148] = 180, [149] = 180, [167] = 120, [173] = 45, [186] = 90, [193] = 30, [194] = 216, [404] = 120
 }
 
--- Prioritize duration by spell id (closer to XIUI behavior than buff-only fallback).
+-- Durations by spell id (preferred over the buff-id table).
 local spell_duration = {
     -- Dia/Bio
     [23] = 60, [24] = 120, [25] = 150, [33] = 60, [230] = 60, [231] = 120, [232] = 150,
@@ -93,13 +112,13 @@ local spell_effects = {
     [890] = {buff = 186, duration = 90, on_damage = true},
     [891] = {buff = 186, duration = 90, on_damage = true},
     [892] = {buff = 186, duration = 90, on_damage = true},
-    [722] = {buff = 7, on_damage = true},                                  -- Entomb
-    [727] = {buff = 6, duration = 300, on_damage = true},                  -- Silent Storm
-    [728] = {buff = 149, on_damage = true},                                -- Tenebral Crush
+    -- BLU AoE enfeebles deal damage even when resisted: track from explicit status-on only.
+    [722] = {buff = 7},                                                     -- Entomb
+    [727] = {buff = 6, duration = 300},                                     -- Silent Storm
+    [728] = {buff = 149},                                                   -- Tenebral Crush
 }
 
--- AoE crowd-control spells that can arrive with incomplete per-target status messages
--- on some packet parsers/servers. We still rely on status-off/death to clear them.
+-- AoE CC that some parsers/servers report without per-target status messages.
 local aoe_cc_spells = {
     [253] = true, -- Sleep
     [273] = true, -- Sleepga
@@ -128,9 +147,20 @@ local wake_damage_messages = {
     [265] = true, -- spell damage variant
 }
 local negative_player_status = S{
-    2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 19, 28, 29, 30, 31, 128, 129, 130, 131, 132, 133, 134, 135,
-    136, 137, 138, 147, 148, 149, 156, 167, 186, 192, 193, 194, 387, 404
+    2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 19, 21, 28, 29, 30, 31, 128, 129, 130, 131, 132, 133, 134, 135,
+    136, 137, 138, 139, 140, 141, 142, 144, 145, 146, 147, 148, 149, 156, 167, 168, 174, 175, 186,
+    192, 193, 194, 217, 404, 597,
+    386, 387, 388, 389, 390, 391, 392, 393, 394, 395, 396, 397, 398, 399, 400, -- Step dazes
+    448, 449, 450, 451, 452,
 }
+-- DNC steps: message -> first buff id of that daze family; param is the daze level (1-5).
+local step_daze_messages = {
+    [519] = 386, -- Quickstep: Lethargic Daze
+    [520] = 391, -- Box Step: Sluggish Daze
+    [521] = 396, -- Stutter Step: Weakened Daze
+    [591] = 448, -- Feather Step: Bewildered Daze
+}
+local STEP_DAZE_SECS = 60
 local claim_cache = {
     at = 0,
     all_ids = {},
@@ -187,6 +217,8 @@ local function spell_tier(spell_id)
     return nil
 end
 
+local tier_markable_buffs = {[3] = true, [5] = true, [134] = true, [135] = true} -- Poison, Blind, Dia, Bio
+
 function M.resolve_tier_label(buff_id, spell_id)
     if tonumber(buff_id or 0) == 19 then
         return '2' -- Sleep II
@@ -197,8 +229,7 @@ function M.resolve_tier_label(buff_id, spell_id)
             return tostring(t) -- Lullaby II
         end
     end
-    local markable = S{3, 5, 134, 135} -- Poison, Blind, Dia, Bio
-    if not markable:contains(tonumber(buff_id or 0)) then
+    if not tier_markable_buffs[tonumber(buff_id or 0)] then
         return nil
     end
     local t = spell_tier(spell_id)
@@ -239,13 +270,13 @@ local function infer_named_effect(spell_id)
         return nil
     end
     if n == 'Entomb' then
-        return {buff = 7, on_damage = true}
+        return {buff = 7}
     end
     if n == 'Silent Storm' then
-        return {buff = 6, duration = 300, on_damage = true}
+        return {buff = 6, duration = 300}
     end
     if n == 'Tenebral Crush' then
-        return {buff = 149, on_damage = true}
+        return {buff = 149}
     end
     return nil
 end
@@ -263,10 +294,70 @@ local function infer_spell_status_buff(spell_id)
     return nil
 end
 
+local function parse_override_duration(value)
+    local d = tonumber(value or 0) or 0
+    if d > 0 then
+        return math.floor(d)
+    end
+    if type(value) ~= 'string' then
+        return nil
+    end
+    local n = tonumber((value:match('^%s*(%d+)') or '')) or 0
+    if n > 0 then
+        return math.floor(n)
+    end
+    return nil
+end
+
+local function resolve_kind_override(tbl, id)
+    if type(tbl) ~= 'table' then
+        return nil
+    end
+    local n = tonumber(id or 0) or 0
+    if n <= 0 then
+        return nil
+    end
+    local key = 'id_' .. tostring(n)
+    local d = parse_override_duration(tbl[n]) or parse_override_duration(tbl[tostring(n)]) or parse_override_duration(tbl[key])
+    if d and d > 0 then
+        return d
+    end
+    return nil
+end
+
+local function resolve_duration_override(state, buff_id, spell_id)
+    local ov = state and state.duration_overrides or nil
+    if type(ov) ~= 'table' then
+        return nil
+    end
+
+    local sid = tonumber(spell_id or 0) or 0
+    if sid > 0 and type(ov.spell) == 'table' then
+        local d = resolve_kind_override(ov.spell, sid)
+        if d then
+            return d
+        end
+    end
+
+    local bid = tonumber(buff_id or 0) or 0
+    if bid > 0 and type(ov.buff) == 'table' then
+        local d = resolve_kind_override(ov.buff, bid)
+        if d then
+            return d
+        end
+    end
+
+    return nil
+end
+
 local function monster_ability_status(ability_id)
     local id = tonumber(ability_id or 0) or 0
     if id <= 0 then
         return nil
+    end
+    local forced_status = tonumber(monster_ability_status_overrides[id] or 0) or 0
+    if forced_status > 0 and forced_status <= 1024 and res.buffs[forced_status] then
+        return forced_status
     end
     local ability = res.monster_abilities and res.monster_abilities[id] or nil
     local status_id = tonumber(ability and ability.status or 0) or 0
@@ -274,6 +365,31 @@ local function monster_ability_status(ability_id)
         return status_id
     end
     return nil
+end
+
+local function monster_ability_actor_status(ability_id)
+    local id = tonumber(ability_id or 0) or 0
+    if id <= 0 then
+        return nil
+    end
+    local forced_status = tonumber(monster_ability_status_overrides[id] or 0) or 0
+    if forced_status > 0 and forced_status <= 1024 and res.buffs[forced_status] then
+        return forced_status
+    end
+    return nil
+end
+
+local function is_spike_buff(buff_id)
+    local id = tonumber(buff_id or 0) or 0
+    if id <= 0 or id > 1024 then
+        return false
+    end
+    local b = res.buffs and res.buffs[id] or nil
+    if not b then
+        return false
+    end
+    local en = string.lower(tostring(b.en or b.enl or ''))
+    return en:find('spikes', 1, true) ~= nil
 end
 
 local function resolve_buff_id(act, action)
@@ -290,7 +406,7 @@ local function resolve_buff_id(act, action)
         return spell_to_buff[spell_id]
     end
     local buff_id = action.param or action.Param
-    -- Some packets put spell id in action.param; only accept as buff if it is a real buff id.
+    -- action.param may hold a spell id; accept it only if it is a real buff id.
     if buff_id and buff_id > 0 and buff_id <= 1024 and res.buffs[buff_id] then
         return buff_id
     end
@@ -440,7 +556,16 @@ local function pick_sleep_family_from_values(v1, v2, v3)
     return 0
 end
 
-local function apply_debuff(state, tid, buff_id, duration, clear_buff, spell_id)
+local function learned_key(actor_id, spell_id)
+    local aid = tonumber(actor_id or 0) or 0
+    local sid = tonumber(spell_id or 0) or 0
+    if aid <= 0 or sid <= 0 then
+        return nil
+    end
+    return aid * 4096 + sid
+end
+
+local function apply_debuff(state, tid, buff_id, duration, clear_buff, spell_id, actor_id)
     if not state.mob_debuffs[tid] then
         state.mob_debuffs[tid] = {}
     end
@@ -459,8 +584,120 @@ local function apply_debuff(state, tid, buff_id, duration, clear_buff, spell_id)
         state.mob_debuffs[tid][clear_buff] = nil
         state.mob_debuff_marks[tid][clear_buff] = nil
     end
-    state.mob_debuffs[tid][buff_id] = util.unix_now() + (duration or resolve_duration(buff_id, spell_id))
+    local forced = resolve_duration_override(state, buff_id, spell_id)
+    local key = learned_key(actor_id, spell_id)
+    local learned = key and learned_duration[key] or nil
+    local base = duration or resolve_duration(buff_id, spell_id)
+    local final_duration = forced or learned or base
+    local now_u = util.unix_now()
+    state.mob_debuffs[tid][buff_id] = now_u + final_duration
     state.mob_debuff_marks[tid][buff_id] = M.resolve_tier_label(buff_id, spell_id)
+    state.mob_debuff_meta = state.mob_debuff_meta or {}
+    state.mob_debuff_meta[tid] = state.mob_debuff_meta[tid] or {}
+    state.mob_debuff_meta[tid][buff_id] = {
+        at = now_u,
+        spell_id = tonumber(spell_id or 0) or 0,
+        key = key,
+        base = base,
+        forced = forced ~= nil,
+        predicted = final_duration,
+        actor = tonumber(actor_id or 0) or 0,
+    }
+end
+
+-- On a natural wear-off, remember how long it really lasted for this caster + spell.
+local function learn_duration(state, tid, buff_id)
+    local metas = state.mob_debuff_meta and state.mob_debuff_meta[tid] or nil
+    if not metas then
+        return
+    end
+    local meta_id = buff_id
+    if not metas[meta_id] and (buff_id == 2 or buff_id == 19 or buff_id == 193) then
+        -- Lullaby goes on as 193 but can wear off reported as plain sleep (and vice versa).
+        for _, sid in ipairs(sleep_family_ids) do
+            if metas[sid] then
+                meta_id = sid
+                break
+            end
+        end
+    end
+    local meta = metas[meta_id]
+    metas[meta_id] = nil
+    if not meta or meta.forced or not meta.key then
+        return
+    end
+    local observed = util.unix_now() - (meta.at or 0)
+    local base = tonumber(meta.base or 0) or 0
+    if base <= 0 then
+        return
+    end
+    local prev = learned_duration[meta.key]
+    if early_ending_buffs:contains(meta_id) then
+        -- Keep the longest natural duration seen.
+        if observed > (tonumber(meta.predicted or base) or base) and observed <= base * 4 then
+            learned_duration[meta.key] = math.max(prev or 0, observed)
+        end
+        return
+    end
+    -- Reject outliers (missed re-apply, packet loss, early removal).
+    if observed < base * 0.5 or observed > base * 3 then
+        return
+    end
+    learned_duration[meta.key] = prev and (prev * 0.5 + observed * 0.5) or observed
+end
+
+local function dot_can_apply(state, tid, spell_id)
+    local p = dot_priority[tonumber(spell_id or 0) or 0]
+    if not p then
+        return true
+    end
+    local dset = state.mob_debuffs[tid]
+    local metas = state.mob_debuff_meta and state.mob_debuff_meta[tid] or nil
+    if not dset or not metas then
+        return true
+    end
+    local now_u = util.unix_now()
+    for _, b in ipairs({134, 135}) do
+        local m = metas[b]
+        if dset[b] and dset[b] > now_u and m then
+            local cur = dot_priority[m.spell_id] or 0
+            if cur > p then
+                return false
+            end
+        end
+    end
+    return true
+end
+
+function M.reset_learned_durations()
+    learned_duration = {}
+end
+
+-- Player ids are below 0x01000000; mob ids are per zone and not worth saving.
+local function key_is_player(key)
+    return math.floor(key / 4096) < 0x01000000
+end
+
+function M.export_learned_durations()
+    local out = {}
+    for key, secs in pairs(learned_duration) do
+        if key_is_player(key) then
+            out[key] = math.floor(secs * 10 + 0.5) / 10
+        end
+    end
+    return out
+end
+
+function M.import_learned_durations(tbl)
+    if type(tbl) ~= 'table' then
+        return
+    end
+    for key, secs in pairs(tbl) do
+        local k, v = tonumber(key), tonumber(secs)
+        if k and v and v > 0 and key_is_player(k) then
+            learned_duration[k] = v
+        end
+    end
 end
 
 local clear_target_buff
@@ -528,6 +765,9 @@ function M.apply_action(state, act, settings, windower_ref)
     if not act or not targets then
         return
     end
+    if settings and type(settings.duration) == 'table' then
+        state.duration_overrides = settings.duration
+    end
 
     local action_type = tonumber(act.category or act.type or act.Type or 0) or 0
     local spell_id = act.param or act.Param
@@ -548,9 +788,17 @@ function M.apply_action(state, act, settings, windower_ref)
     end
     local actor_id = tonumber(act.actor_id or act.actor or act.Actor or act.UserId or act.user_id or 0) or 0
     local all_ids = get_all_ids_cached()
-    local me = windower_ref and windower_ref.ffxi and windower_ref.ffxi.get_player and windower_ref.ffxi.get_player() or nil
-    local myid = tonumber(me and me.id or 0) or 0
+    local myid = util.player_id()
     local actor_is_party = (actor_id > 0 and all_ids and all_ids[actor_id]) or (actor_id > 0 and actor_id == myid) or false
+
+    -- Some monster abilities buff the caster without a per-target status-on.
+    local actor_buff = monster_ability_actor_status(spell_id)
+    if actor_buff and actor_id > 0 then
+        local actor_mob = windower_ref and windower_ref.ffxi and windower_ref.ffxi.get_mob_by_id and windower_ref.ffxi.get_mob_by_id(actor_id) or nil
+        if actor_mob and actor_mob.is_npc then
+            apply_debuff(state, actor_id, actor_buff, nil, nil, spell_id)
+        end
+    end
 
     if actor_is_party and action_type == 4 and spell_id and aoe_cc_spells[spell_id] then
         state.last_cc_by_actor = state.last_cc_by_actor or {}
@@ -568,9 +816,9 @@ function M.apply_action(state, act, settings, windower_ref)
         local target_is_npc = target_mob and target_mob.is_npc or false
         if tid then
             if actor_is_party then
-                -- Record engagement early even when this packet does not include per-target actions.
+                -- Record engagement even when the packet has no per-target actions.
                 mark_party_touch(state, tid)
-                -- AoE fallback only when parser provides no per-target action details.
+                -- AoE fallback only when the parser gives no per-target actions.
                 if action_type == 4 and spell_id and aoe_cc_spells[spell_id] and (not has_actions(tactions)) then
                     local b = spell_to_buff[spell_id]
                     if b and M.is_negative_player_status(b) and target_is_npc then
@@ -581,7 +829,6 @@ function M.apply_action(state, act, settings, windower_ref)
         end
         if tid and tactions then
             if actor_is_party and target_is_npc then
-                -- Track party engagement even before hate is established.
                 mark_party_touch(state, tid)
             end
             for _, action in pairs(tactions) do
@@ -595,6 +842,39 @@ function M.apply_action(state, act, settings, windower_ref)
                     clear_sleep_family(state, tid)
                 end
 
+                if target_is_npc and action and action.has_spike_effect then
+                    local spike_id = tonumber(action.spike_effect_param or action.SpikeEffectParam or 0) or 0
+                    if is_spike_buff(spike_id) then
+                        apply_debuff(state, tid, spike_id, nil, nil, spell_id)
+                    end
+                end
+
+                if target_is_npc and actor_is_party then
+                    local has_add = action.has_add_effect or action['Has Added Effect']
+                    local add_msg = tonumber(action.add_effect_message or action['Added Effect Message'] or 0) or 0
+                    local add_buff = tonumber(action.add_effect_param or action['Added Effect Param'] or 0) or 0
+                    if has_add and status_on_messages:contains(add_msg) and M.is_negative_player_status(add_buff)
+                        and M.is_trackable_enemy_status(add_buff) then
+                        apply_debuff(state, tid, add_buff, nil, nil, nil, actor_id)
+                        mark_party_touch(state, tid)
+                    end
+                end
+
+                local daze_base = step_daze_messages[tonumber(message or 0) or 0]
+                if daze_base and target_is_npc then
+                    local lv = math.max(1, math.min(5, ap))
+                    for i = 0, 4 do
+                        if state.mob_debuffs[tid] then
+                            state.mob_debuffs[tid][daze_base + i] = nil
+                        end
+                    end
+                    apply_debuff(state, tid, daze_base + lv - 1, STEP_DAZE_SECS, nil, nil, actor_id)
+                    state.mob_debuff_marks[tid][daze_base + lv - 1] = tostring(lv)
+                    if actor_is_party then
+                        mark_party_touch(state, tid)
+                    end
+                end
+
                 if death_messages:contains(message) then
                     state.mob_debuffs[tid] = nil
                     if state.mob_debuff_marks then
@@ -603,12 +883,15 @@ function M.apply_action(state, act, settings, windower_ref)
                     if state.mob_party_touch then
                         state.mob_party_touch[tid] = nil
                     end
+                    if state.mob_debuff_meta then
+                        state.mob_debuff_meta[tid] = nil
+                    end
                     if state.target_buffs then
                         state.target_buffs[tid] = nil
                     end
                 elseif effect and effect.on_damage and spell_damage_messages:contains(message) then
-                    if target_is_npc then
-                        apply_debuff(state, tid, effect.buff, effect.duration, effect.clear, spell_id)
+                    if target_is_npc and dot_can_apply(state, tid, spell_id) then
+                        apply_debuff(state, tid, effect.buff, effect.duration, effect.clear, spell_id, actor_id)
                     end
                     if actor_is_party and target_is_npc then
                         mark_party_touch(state, tid)
@@ -619,7 +902,7 @@ function M.apply_action(state, act, settings, windower_ref)
                     local actor_is_brdish = actor_is_bard(windower_ref, actor_id)
                     if cc_like_message and (not spell_id or spell_id == 0) and (buff_id == 2 or buff_id == 19) then
                         local original_sleep = buff_id
-                        -- Windower can omit BRD spell id in some Retail recasts; prefer lullaby icon when likely BRD.
+                        -- Retail can omit the BRD spell id on recasts: prefer Lullaby when the caster is likely a BRD.
                         if state.mob_debuffs[tid] and state.mob_debuffs[tid][193] then
                             buff_id = 193
                             applied_spell_id = (original_sleep == 19) and 377 or 376
@@ -650,7 +933,7 @@ function M.apply_action(state, act, settings, windower_ref)
                         end
                     end
                     if (not spell_id or spell_id == 0) and (buff_id == 2 or buff_id == 19) and actor_is_brdish then
-                        -- Some Retail packets mark lullaby as generic sleep without cc-like message metadata.
+                        -- Some Retail packets report Lullaby as plain sleep.
                         local prev = buff_id
                         buff_id = 193
                         if not applied_spell_id or applied_spell_id == 0 then
@@ -680,7 +963,7 @@ function M.apply_action(state, act, settings, windower_ref)
                         local track_on_npc = M.is_trackable_enemy_status(buff_id)
                         if target_is_npc then
                             if track_on_npc then
-                                apply_debuff(state, tid, buff_id, duration, clear, applied_spell_id)
+                                apply_debuff(state, tid, buff_id, duration, clear, applied_spell_id, actor_id)
                                 if actor_is_party and M.is_negative_player_status(buff_id) then
                                     mark_party_touch(state, tid)
                                 end
@@ -690,8 +973,7 @@ function M.apply_action(state, act, settings, windower_ref)
                         end
                     end
                 elseif status_off_messages:contains(message) then
-                    -- For status-off, trust explicit action param only.
-                    -- Using spell-id fallback here causes false clears on re-casts over already-slept targets.
+                    -- Status-off: trust only the explicit param (a spell-id fallback falsely clears re-slept targets).
                     local raw = tonumber(action.param or action.Param or 0) or 0
                     local buff_id = nil
                     if raw > 0 and raw <= 1024 and res.buffs[raw] then
@@ -700,7 +982,7 @@ function M.apply_action(state, act, settings, windower_ref)
                     if buff_id and buff_id > 0 then
                         local sleep_family = is_sleep_family_buff(buff_id)
                         if sleep_family then
-                            -- Clear sleep on explicit status-off except when this same action is a sleep-family re-cast.
+                            -- Unless this same action is a sleep-family recast.
                             if not spell_is_sleep_family(spell_id) then
                                 clear_sleep_family(state, tid)
                             end
@@ -742,8 +1024,7 @@ function M.apply_basic_message(state, basic, windower_ref)
     elseif v > 0 then
         buff_id = v
     end
-    -- Normalize known CC spell ids to buff ids only for status-on handling.
-    -- For status-off, param may not be a buff id and should not force a clear.
+    -- Map CC spell ids to buff ids for status-on only (status-off params may not be buff ids).
     if status_on_messages:contains(message_id) and buff_id > 0 and aoe_cc_spells[buff_id] and spell_to_buff[buff_id] then
         buff_id = spell_to_buff[buff_id]
     end
@@ -765,13 +1046,16 @@ function M.apply_basic_message(state, basic, windower_ref)
         if state.mob_party_touch then
             state.mob_party_touch[target_id] = nil
         end
+        if state.mob_debuff_meta then
+            state.mob_debuff_meta[target_id] = nil
+        end
         if state.target_buffs then
             state.target_buffs[target_id] = nil
         end
         return
     end
 
-    -- BRD/CC AoE can report reliably through 0x029 per-target status-on messages.
+    -- 0x029 status-on is the reliable per-target signal for AoE CC.
     if status_on_messages:contains(message_id) then
         local b = tonumber(buff_id or 0) or 0
         local original_b = b
@@ -798,19 +1082,23 @@ function M.apply_basic_message(state, basic, windower_ref)
             if t and t.is_npc then
                 local aid = tonumber(actor_id or 0) or 0
                 local all_ids = get_all_ids_cached()
-                local me = windower_ref and windower_ref.ffxi and windower_ref.ffxi.get_player and windower_ref.ffxi.get_player() or nil
-                local myid = tonumber(me and me.id or 0) or 0
+                local myid = util.player_id()
                 local actor_ok = (aid == 0) or ((aid > 0 and all_ids and all_ids[aid]) or (aid > 0 and aid == myid))
                 local track_on_npc = M.is_trackable_enemy_status(b)
                 if track_on_npc then
                     local used_spell = inferred_spell_id
-                    apply_debuff(state, target_id, b, resolve_duration(b, used_spell), nil, used_spell)
+                    apply_debuff(state, target_id, b, resolve_duration(b, used_spell), nil, used_spell, actor_ok and aid or nil)
                     if actor_ok and M.is_negative_player_status(b) then
                         mark_party_touch(state, target_id)
                     end
                 end
             end
         end
+    end
+
+    -- Learn first: the effect may have outlived our timer.
+    if natural_wear_messages:contains(message_id) and buff_id and buff_id > 0 then
+        learn_duration(state, target_id, buff_id)
     end
 
     if not state.mob_debuffs[target_id] then
@@ -847,6 +1135,18 @@ end
 
 function M.clear_expired(state)
     local t = util.unix_now()
+    if state.mob_debuff_meta then
+        for mob_id, metas in pairs(state.mob_debuff_meta) do
+            for buff_id, m in pairs(metas) do
+                if t > (m.at or 0) + (m.base or 0) * 4 + 5 then
+                    metas[buff_id] = nil
+                end
+            end
+            if next(metas) == nil then
+                state.mob_debuff_meta[mob_id] = nil
+            end
+        end
+    end
     for mob_id, debuffs in pairs(state.mob_debuffs) do
         local has_any = false
         for buff_id, expires in pairs(debuffs) do
@@ -864,7 +1164,12 @@ function M.clear_expired(state)
             if state.mob_debuff_marks then
                 state.mob_debuff_marks[mob_id] = nil
             end
-            if state.mob_party_touch then
+        end
+    end
+    -- Party touch is hate evidence with its own lifetime.
+    if state.mob_party_touch then
+        for mob_id, at in pairs(state.mob_party_touch) do
+            if t - (tonumber(at) or 0) > PARTY_TOUCH_KEEP_SECS then
                 state.mob_party_touch[mob_id] = nil
             end
         end
@@ -932,6 +1237,16 @@ function M.get_active_ids(state, mob_id, max_items)
     return ids
 end
 
+local function entry_owner(state, mob_id, buff_id)
+    local metas = state.mob_debuff_meta and state.mob_debuff_meta[mob_id] or nil
+    local m = metas and metas[buff_id] or nil
+    local actor = m and tonumber(m.actor or 0) or 0
+    if actor <= 0 then
+        return nil
+    end
+    return actor == util.player_id()
+end
+
 function M.get_active_entries(state, mob_id, max_items)
     local dset = state.mob_debuffs[mob_id]
     if not dset then
@@ -947,6 +1262,8 @@ function M.get_active_entries(state, mob_id, max_items)
                 remaining = math.max(0, expires - t),
                 name = M.buff_name(buff_id),
                 mark = state.mob_debuff_marks and state.mob_debuff_marks[mob_id] and state.mob_debuff_marks[mob_id][buff_id] or nil,
+                -- true = cast by me, false = cast by someone else, nil = unknown caster
+                mine = entry_owner(state, mob_id, buff_id),
             }
         end
     end

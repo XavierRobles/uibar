@@ -2,6 +2,15 @@
 <settings>
     <global>
         <drag_locked>false</drag_locked>
+        <duration>
+            <buff>
+                <id_49>30 | Perfect Dodge</id_49>
+                <id_50>30 | Invincible</id_50>
+            </buff>
+            <spell>
+
+            </spell>
+        </duration>
         <enabled>true</enabled>
         <enemy>
             <bg_alpha>210</bg_alpha>
@@ -47,136 +56,132 @@
     </global>
     <arktema>
         <enemy>
-            <x>197</x>
-            <y>593</y>
+            <x>331</x>
+            <y>373</y>
         </enemy>
         <target>
-            <x>561</x>
-            <y>745</y>
+            <x>727</x>
+            <y>730</y>
         </target>
     </arktema>
     <arkys>
-        <drag_locked>true</drag_locked>
         <enemy>
-            <x>30</x>
-            <y>242</y>
+            <x>331</x>
+            <y>373</y>
         </enemy>
         <target>
-            <x>652</x>
-            <y>684</y>
+            <x>673</x>
+            <y>690</y>
         </target>
     </arkys>
     <atenelis>
-        <drag_locked>true</drag_locked>
         <enemy>
-            <x>30</x>
-            <y>242</y>
+            <x>331</x>
+            <y>373</y>
         </enemy>
         <target>
-            <x>609</x>
-            <y>693</y>
+            <x>635</x>
+            <y>695</y>
         </target>
     </atenelis>
     <jenifer>
         <enemy>
-            <x>177</x>
-            <y>539</y>
+            <x>331</x>
+            <y>373</y>
         </enemy>
         <target>
-            <x>651</x>
-            <y>655</y>
+            <x>656</x>
+            <y>670</y>
         </target>
     </jenifer>
     <miau>
         <enemy>
-            <x>197</x>
-            <y>593</y>
+            <x>331</x>
+            <y>373</y>
         </enemy>
         <target>
-            <x>593</x>
-            <y>650</y>
+            <x>694</x>
+            <y>686</y>
         </target>
     </miau>
     <misti>
-        <drag_locked>true</drag_locked>
         <enemy>
-            <x>30</x>
-            <y>242</y>
+            <x>331</x>
+            <y>373</y>
         </enemy>
         <target>
-            <x>609</x>
-            <y>693</y>
+            <x>621</x>
+            <y>757</y>
         </target>
     </misti>
     <todoacien>
         <enemy>
-            <x>29</x>
-            <y>166</y>
+            <x>331</x>
+            <y>373</y>
         </enemy>
         <target>
-            <x>624</x>
-            <y>699</y>
+            <x>659</x>
+            <y>697</y>
         </target>
     </todoacien>
     <ventas>
         <enemy>
-            <x>197</x>
-            <y>593</y>
+            <x>331</x>
+            <y>373</y>
         </enemy>
         <target>
-            <x>622</x>
-            <y>661</y>
+            <x>699</x>
+            <y>694</y>
         </target>
     </ventas>
     <waky>
         <enemy>
-            <x>226</x>
-            <y>592</y>
+            <x>338</x>
+            <y>370</y>
         </enemy>
         <target>
-            <x>671</x>
-            <y>699</y>
+            <x>625</x>
+            <y>778</y>
         </target>
     </waky>
     <wik>
         <enemy>
-            <x>304</x>
-            <y>567</y>
+            <x>331</x>
+            <y>373</y>
         </enemy>
         <target>
-            <x>642</x>
-            <y>690</y>
+            <x>669</x>
+            <y>721</y>
         </target>
     </wik>
     <wike>
         <enemy>
-            <x>197</x>
-            <y>593</y>
+            <x>331</x>
+            <y>373</y>
         </enemy>
         <target>
-            <x>575</x>
-            <y>657</y>
+            <x>598</x>
+            <y>768</y>
         </target>
     </wike>
     <yinx>
         <enemy>
-            <x>29</x>
-            <y>166</y>
+            <x>331</x>
+            <y>373</y>
         </enemy>
         <target>
-            <x>660</x>
-            <y>706</y>
+            <x>615</x>
+            <y>698</y>
         </target>
     </yinx>
     <zorrilla>
-        <drag_locked>true</drag_locked>
         <enemy>
-            <x>30</x>
-            <y>242</y>
+            <x>331</x>
+            <y>373</y>
         </enemy>
         <target>
-            <x>609</x>
-            <y>693</y>
+            <x>593</x>
+            <y>685</y>
         </target>
     </zorrilla>
 </settings>

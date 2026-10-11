@@ -1,6 +1,6 @@
 local util = require('uibarutil')
-local party = require('uibarparty')
 local debuffs = require('uibardebuffs')
+local hate = require('uibarhate')
 
 local M = {}
 
@@ -37,14 +37,8 @@ local function tp_color(tp)
     return 170, 140, 95
 end
 
-local function enemy_sort(a, b)
-    if a.distance ~= b.distance then
-        return a.distance < b.distance
-    end
-    if a.hpp ~= b.hpp then
-        return a.hpp < b.hpp
-    end
-    return a.name < b.name
+local function to_n(v)
+    return tonumber(v or 0) or 0
 end
 
 function M.format_main(settings)
@@ -115,43 +109,18 @@ function M.format_target(settings, state)
 end
 
 function M.format_enemy_list(settings, state)
-    local mobs = windower.ffxi.get_mob_array()
-    if not mobs then
-        return 'ENEMY LIST (0)\nEsperando datos...'
-    end
-
-    local party_ids = party.get_party_member_ids()
+    local rows = hate.collect(settings, state)
     local enemies = {}
-    local scan_sq = settings.enemy_scan_range * settings.enemy_scan_range
-
-    for _, mob in pairs(mobs) do
-        if mob and mob.is_npc and mob.valid_target and mob.hpp and mob.hpp > 0 and mob.distance then
-            if mob.target_index and mob.target_index > 0 then
-                local target_mob = windower.ffxi.get_mob_by_index(mob.target_index)
-                local within_range = (settings.enemy_scan_range <= 0) or (mob.distance <= scan_sq)
-                if target_mob and party_ids[target_mob.id] and within_range then
-                    local claimed = mob.claim_id and mob.claim_id ~= 0
-                    local party_claim = claimed and party_ids[mob.claim_id] or false
-                    enemies[#enemies + 1] = {
-                        id = mob.id,
-                        name = util.sanitize_name(mob.name),
-                        hpp = mob.hpp,
-                        distance = math.sqrt(math.max(0, mob.distance)),
-                        target = util.sanitize_name(target_mob.name),
-                        label = party_claim and '[PT]' or (claimed and '[CL]' or '[AG]'),
-                    }
-                end
-            end
-        end
-    end
-
-    table.sort(enemies, enemy_sort)
-    if #enemies > settings.max_enemies then
-        local trimmed = {}
-        for i = 1, settings.max_enemies do
-            trimmed[i] = enemies[i]
-        end
-        enemies = trimmed
+    for _, r in ipairs(rows) do
+        local claimed = to_n(r.mob.claim_id) > 0
+        enemies[#enemies + 1] = {
+            id = r.mob.id,
+            name = util.sanitize_name(r.mob.name),
+            hpp = r.hpp,
+            distance = r.distance,
+            target = r.target and util.sanitize_name(r.target.name) or '?',
+            label = r.claim_is_ours and '[PT]' or (claimed and '[CL]' or '[AG]'),
+        }
     end
 
     local lines = {string.format('%s (%d)', colorize('ENEMY LIST', 235, 235, 235), #enemies)}

@@ -1,11 +1,28 @@
 local M = {}
 
+-- On Windows os.clock() is wall time with sub-second resolution (os.time() has whole seconds).
 function M.frame_now()
     return os.clock()
 end
 
+-- High-resolution clock for timers and caches (old name kept for callers).
 function M.unix_now()
-    return os.time()
+    return os.clock()
+end
+
+local player_id = 0
+
+-- get_player() builds a large table (buffs, skills, jobs); avoid it in hot paths.
+function M.player_id()
+    if player_id <= 0 then
+        local me = windower.ffxi.get_player()
+        player_id = tonumber(me and me.id or 0) or 0
+    end
+    return player_id
+end
+
+function M.invalidate_player()
+    player_id = 0
 end
 
 function M.to_bar(value, max_value, width)
